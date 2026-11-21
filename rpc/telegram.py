@@ -30,13 +30,14 @@ class TelegramRPC:
 
             commands = {
                 "status": self.cmd_status,
+                "stats": self.cmd_stats,
                 "balance": self.cmd_balance,
                 "profit": self.cmd_profit,
                 "trades": self.cmd_trades,
+                "trades_now": self.cmd_trades_now,
                 "performance": self.cmd_performance,
                 "count": self.cmd_count,
                 "daily": self.cmd_daily,
-                "stats": self.cmd_stats,
                 "forceexit": self.cmd_forceexit,
                 "stop": self.cmd_stop,
                 "start": self.cmd_start,
@@ -281,25 +282,89 @@ class TelegramRPC:
         )
         await update.message.reply_text(text, parse_mode="Markdown")
 
+    async def cmd_trades_now(self, update, context) -> None:
+        """Show live open positions in a compact table format — instant snapshot."""
+        positions = self._get_live_positions()
+        bal = self._get_live_balance()
+        if not positions:
+            await update.message.reply_text(
+                f"*📋 Trades Now:* No open positions\nEquity: `{bal['total']:.4f} USDT`",
+                parse_mode="Markdown",
+            )
+            return
+
+        # Compact table: Symbol | Side | Qty | Entry | Mark | UPnL | ROI%
+        rows = []
+        for p in positions:
+            symbol = p.get("symbol", "?")
+            amt = float(p.get("positionAmt", 0))
+            entry = float(p.get("entryPrice", 0))
+            mark = float(p.get("markPrice", 0))
+            upnl = float(p.get("unRealizedProfit", 0))
+            lev = float(p.get("leverage", 0))
+            side = "L" if amt > 0 else "S"
+            roi = ((mark - entry) / entry * 100) if entry > 0 else 0
+            if amt < 0:
+                roi = -roi
+            emoji = "🟢" if upnl >= 0 else "🔴"
+            rows.append(
+                f"{emoji} `{symbol}` {side} {abs(amt):.2f} @ `{entry:.6f}` → `{mark:.6f}` | `{upnl:+.4f}` ({roi:+.2f}%) `{lev:.0f}x`"
+            )
+
+        total_upnl = sum(float(p.get("unRealizedProfit", 0)) for p in positions)
+        text = (
+            f"*📋 Trades Now ({len(positions)} open)*\n"
+            f"Total UPnL: `{total_upnl:+.4f} USDT`\n"
+            f"Equity: `{bal['total']:.4f} USDT`\n\n"
+            + "\n".join(rows)
+        )
+        await update.message.reply_text(text, parse_mode="Markdown")
+
     async def cmd_stats(self, update, context) -> None:
-        """Overall stats from live Binance account data."""
+        """Detailed stats table with per-position metrics, margin usage, and strategy info."""
         bal = self._get_live_balance()
         positions = self._get_live_positions()
-        unrealized = sum(float(p.get("unRealizedProfit", 0)) for p in positions)
         worker = self.bot_worker
+        unrealized = sum(float(p.get("unRealizedProfit", 0)) for p in positions)
+
+        # Per-position table with margin, notional, ROI
+        lines = []
+        for p in positions:
+            symbol = p.get("symbol", "?")
+            amt = float(p.get("positionAmt", 0))
+            entry = float(p.get("entryPrice", 0))
+            mark = float(p.get("markPrice", 0))
+            upnl = float(p.get("unRealizedProfit", 0))
+            lev = float(p.get("leverage", 0))
+            init_margin = float(p.get("initialMargin", 0))
+            notional = abs(amt) * mark
+            roi = ((mark - entry) / entry * 100) if entry > 0 else 0
+            if amt < 0:
+                roi = -roi
+            side = "LONG" if amt > 0 else "SHORT"
+            lines.append(
+                f"{side:5s} `{symbol}` | Qty `{abs(amt):.4f}` | Lev `{lev:.0f}x` | "
+                f"Entry `{entry:.6f}` Mark `{mark:.6f}` | "
+                f"UPnL `{upnl:+.4f}` ({roi:+.2f}%) | Margin `{init_margin:.4f}` | Notional `{notional:.2f}`"
+            )
 
         total_margin = sum(float(p.get("initialMargin", 0)) for p in positions)
-        avg_leverage = (bal["used"] / total_margin) if total_margin > 0 else 0
+        total_notional = sum(abs(float(p.get("positionAmt", 0))) * float(p.get("markPrice", 0)) for p in positions)
+        margin_pct = (total_margin / bal["total"] * 100) if bal["total"] > 0 else 0
 
         text = (
-            f"*📊 Stats (Live)*\n"
-            f"Equity: `{bal['total']:.4f} USDT`\n"
-            f"Free: `{bal['free']:.4f} USDT`\n"
-            f"Used Margin: `{bal['used']:.4f} USDT`\n"
-            f"Unrealized PnL: `{unrealized:.4f} USDT`\n"
-            f"Open Positions: `{len(positions)}`\n"
-            f"Strategy: `{worker.strategy.name if worker else '?'}` @ `{worker.strategy.timeframe if worker else '?'}`\n"
-            f"Pairs Monitored: `{len(worker.pairs) if worker else 0}`"
+            f"*📊 Stats Table (Live)*\n\n"
+            f"*Account Summary:*\n"
+            f"• Equity: `{bal['total']:.4f} USDT`\n"
+            f"• Free: `{bal['free']:.4f} USDT` | Used Margin: `{bal['used']:.4f} USDT`\n"
+            f"• Total UPnL: `{unrealized:+.4f} USDT`\n"
+            f"• Total Notional: `{total_notional:.2f} USDT`\n"
+            f"• Margin Used: `{total_margin:.4f} USDT` ({margin_pct:.1f}% of equity)\n\n"
+            f"*Strategy:*\n"
+            f"• `{worker.strategy.name if worker else '?'}` @ `{worker.strategy.timeframe if worker else '?'}`\n"
+            f"• Pairs: `{len(worker.pairs) if worker else 0}` | Dry Run: `{worker.config.get('dry_run', False) if worker else '?'}`\n\n"
+            f"*Positions ({len(positions)}):*\n"
+            + ("\n".join(lines) if lines else "  None open")
         )
         await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -449,14 +514,10 @@ class TelegramRPC:
             "/count - Open trades count\n"
             "/daily - Daily summary\n"
             "/stats - Overall statistics\n"
-            "/forceexit [PAIR] - Close positions\n"
+            "/forceexit PAIR - Close positions\n"
             "/stop - Stop bot\n"
             "/start - Resume bot\n"
-            "/reload\\_conf - Reload config\n"
-            "/whitelist - Active pairs\n"
-            "/blacklist - Blacklisted pairs\n"
-            "/trade\\_now - Enter nearest signal\n"
-            "/version - Bot version"
+            "/trade\\_now - Enter nearest signal"
         )
         await update.message.reply_text(text, parse_mode="Markdown")
 
