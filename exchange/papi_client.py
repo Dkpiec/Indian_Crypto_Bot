@@ -30,19 +30,20 @@ class PapiClient:
     PAPI_BASE = "https://papi.binance.com/papi/v1"
     FAPI_BASE = "https://fapi.binance.com/fapi/v1"
 
-    # Endpoints that exist ONLY on papi (authenticated trading/account)
+    # Endpoints that exist ONLY on papi (authenticated account/position queries)
+    # Note: order placement goes through fapi — papi /order returns 404 for
+    # symbols not explicitly enabled in the portfolio margin account config.
     PAPI_ONLY_PATHS = {
         "/account",
         "/positionRisk",
-        "/order",
-        "/openOrders",
     }
 
-    # Endpoints that exist ONLY on fapi (public market data)
+    # Endpoints that exist ONLY on fapi (public market data AND order execution)
     FAPI_ONLY_PATHS = {
         "/klines",
         "/ticker/price",
         "/ticker/24hr",
+        "/order",
     }
 
     # Endpoints that don't exist on papi for portfolio margin accounts — mock them
