@@ -54,7 +54,6 @@ pairlists:
       - NEAR/USDT:USDT
       - SUI/USDT:USDT
       - TRX/USDT:USDT
-      - PEPE/USDT:USDT
       - WIF/USDT:USDT
       - FET/USDT:USDT
       - RENDER/USDT:USDT
