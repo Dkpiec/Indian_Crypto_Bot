@@ -28,6 +28,30 @@ class TelegramRPC:
 
             self._app = ApplicationBuilder().token(self.token).build()
 
+            # Register bot menu commands (visible at bottom of Telegram chat)
+            menu_commands = [
+                ("status", "Bot status + live balance"),
+                ("balance", "Live wallet balance"),
+                ("profit", "Unrealized PnL + positions"),
+                ("trades", "Open positions detail"),
+                ("performance", "Per-position ROI"),
+                ("count", "Open trades count"),
+                ("daily", "Daily summary"),
+                ("stats", "Overall statistics"),
+                ("forceexit", "Close positions"),
+                ("stop", "Stop bot"),
+                ("start", "Resume bot"),
+                ("trade_now", "Enter nearest signal"),
+            ]
+            try:
+                from telegram import BotCommand
+                await self._app.bot.set_my_commands(
+                    [BotCommand(cmd, desc) for cmd, desc in menu_commands]
+                )
+                logger.info(f"Registered {len(menu_commands)} bot menu commands")
+            except Exception as e:
+                logger.warning(f"Failed to set bot menu commands: {e}")
+
             commands = {
                 "status": self.cmd_status,
                 "stats": self.cmd_stats,
