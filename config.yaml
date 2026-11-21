@@ -23,7 +23,36 @@ strategy:
 pairlists:
   - method: StaticPairList
     pairs:
+      - BTC/USDT:USDT
+      - ETH/USDT:USDT
+      - SOL/USDT:USDT
+      - BNB/USDT:USDT
+      - XRP/USDT:USDT
+      - DOGE/USDT:USDT
+      - ADA/USDT:USDT
+      - AVAX/USDT:USDT
+      - DOT/USDT:USDT
+      - LINK/USDT:USDT
+      - MATIC/USDT:USDT
+      - UNI/USDT:USDT
+      - ATOM/USDT:USDT
+      - LTC/USDT:USDT
+      - FIL/USDT:USDT
+      - APT/USDT:USDT
+      - ARB/USDT:USDT
+      - OP/USDT:USDT
+      - NEAR/USDT:USDT
+      - SUI/USDT:USDT
       - TRX/USDT:USDT
+      - PEPE/USDT:USDT
+      - WIF/USDT:USDT
+      - FET/USDT:USDT
+      - RENDER/USDT:USDT
+      - INJ/USDT:USDT
+      - TIA/USDT:USDT
+      - SEI/USDT:USDT
+      - JUP/USDT:USDT
+      - PENDLE/USDT:USDT
 
 trading:
   margin_per_trade: 20.0
