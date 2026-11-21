@@ -1,15 +1,16 @@
 """
 Main trading loop worker for Indian_Crypto_Bot.
-Runs the throttle cycle: fetch candles → run strategy → execute signals → update wallets.
+Runs the throttle cycle: fetch candles → run strategy → risk check → execute signals → update wallets.
 """
 
 import logging
 import signal
 import time
-from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Optional
 
 import pandas as pd
+
+from utils.risk_manager import RiskManager
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,11 @@ class BotWorker:
         self.strategy = strategy
         self.wallets = wallets
         self.rpc_manager = rpc_manager
+        self.risk_manager = RiskManager(
+            max_daily_loss_pct=config.get("risk", {}).get("max_daily_loss_pct", 5.0),
+            max_consecutive_losses=config.get("risk", {}).get("max_consecutive_losses", 3),
+            min_adx_for_entry=config.get("risk", {}).get("min_adx_for_entry", 25.0),
+        )
 
         self.state = "STOPPED"  # STOPPED | RUNNING
         self.throttle_secs = config.get("internals", {}).get("process_throttle_secs", 5)
@@ -133,6 +139,15 @@ class BotWorker:
                 # 5. Check latest bar for signals
                 latest = df.iloc[-1]
                 if latest.get("enter_long", 0) == 1:
+                    # Risk check before acting on signal
+                    balance = self.wallets.get_total("USDT")
+                    allowed, reason = self.risk_manager.can_open_trade(balance)
+                    if not allowed:
+                        logger.warning(f"ENTRY blocked by risk manager on {pair}: {reason}")
+                        if self.rpc_manager:
+                            self.rpc_manager.send_message(f"⚠️ *Entry Blocked* `{pair}`\n{reason}")
+                        continue
+
                     logger.info(f"ENTRY signal on {pair}: {latest.get('enter_tag', 'unknown')}")
                     if self.rpc_manager:
                         price = latest["close"]
