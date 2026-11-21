@@ -1,0 +1,34 @@
+# Indian Crypto Bot - Default Configuration
+# Copy to config.yaml and fill in credentials, or use env var injection via entrypoint.sh
+
+exchange:
+  name: binance
+  api_key: ""          # Set via BINANCE_API_KEY env var
+  secret_key: ""      # Set via BINANCE_SECRET_KEY env var
+  trading_mode: futures
+  margin_mode: cross
+
+telegram:
+  enabled: true
+  token: ""           # Set via FREQTRADE_TELEGRAM_TOKEN env var
+  chat_id: ""         # Set via FREQTRADE_TELEGRAM_CHAT_ID env var
+
+strategy:
+  name: ATR_CHANNEL_2H
+  timeframe: 2h
+  max_open_trades: 4
+  stake_currency: USDT
+  stoploss: -0.99
+
+pairlists:
+  - method: StaticPairList
+    pairs:
+      - TRX/USDT:USDT
+
+internals:
+  process_throttle_secs: 5
+  heartbeat_interval: 60
+
+# Set to true for testing without real orders
+dry_run: false
+dry_run_wallet: 1000.0
