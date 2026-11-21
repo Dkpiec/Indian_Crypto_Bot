@@ -110,6 +110,77 @@ class BotWorker:
         self._running = False
         self.state = "STOPPED"
 
+    def trade_now(self) -> dict:
+        """Find the most recent entry signal across all pairs and execute a market buy.
+        Returns a dict with the result for Telegram notification."""
+        import pandas as pd
+
+        best_pair = None
+        best_price = None
+        best_signal_time = 0
+        best_tag = ""
+
+        for pair in self.pairs:
+            try:
+                candles = self.exchange.fetch_ohlcv(pair, self.strategy.timeframe, limit=200)
+                if not candles or len(candles) < 50:
+                    continue
+                df = pd.DataFrame(
+                    candles, columns=["timestamp", "open", "high", "low", "close", "volume"]
+                )
+                metadata = {"pair": pair}
+                df = self.strategy.populate_indicators(df, metadata)
+                df = self.strategy.populate_entry_trend(df, metadata)
+
+                # Find the most recent enter_long==1 bar
+                entry_bars = df[df["enter_long"] == 1]
+                if entry_bars.empty:
+                    continue
+                last_entry = entry_bars.iloc[-1]
+                sig_time = int(last_entry["timestamp"])
+                if sig_time > best_signal_time:
+                    best_signal_time = sig_time
+                    best_pair = pair
+                    best_price = float(last_entry["close"])
+                    best_tag = last_entry.get("enter_tag", "manual")
+            except Exception as e:
+                logger.warning(f"trade_now: error scanning {pair}: {e}")
+                continue
+
+        if best_pair is None:
+            return {"success": False, "reason": "No recent entry signals found across any pair"}
+
+        # Execute market buy with full balance × leverage
+        trading_conf = self.config.get("trading", {})
+        leverage = trading_conf.get("leverage", 5)
+        if trading_conf.get("use_full_balance", False):
+            margin_usdt = self.wallets.get_total("USDT")
+        else:
+            margin_usdt = trading_conf.get("margin_per_trade", 20.0)
+        quantity = (margin_usdt * leverage) / best_price
+
+        try:
+            order = self.exchange.create_order(
+                symbol=best_pair,
+                order_type="MARKET",
+                side="BUY",
+                amount=quantity,
+            )
+            logger.info(f"TRADE_NOW executed: {best_pair} qty={quantity:.4f}")
+            return {
+                "success": True,
+                "pair": best_pair,
+                "price": best_price,
+                "quantity": quantity,
+                "margin_usdt": margin_usdt,
+                "leverage": leverage,
+                "tag": best_tag,
+                "order": order,
+            }
+        except Exception as e:
+            logger.error(f"TRADE_NOW order failed on {best_pair}: {e}", exc_info=True)
+            return {"success": False, "reason": str(e), "pair": best_pair}
+
     def _process(self) -> None:
         """One full iteration of the trading loop."""
         for pair in self.pairs:
@@ -149,8 +220,12 @@ class BotWorker:
                         continue
 
                     price = latest["close"]
-                    margin_usdt = self.config.get("trading", {}).get("margin_per_trade", 20.0)
-                    leverage = self.config.get("trading", {}).get("leverage", 10)
+                    trading_conf = self.config.get("trading", {})
+                    leverage = trading_conf.get("leverage", 5)
+                    if trading_conf.get("use_full_balance", False):
+                        margin_usdt = self.wallets.get_total("USDT")
+                    else:
+                        margin_usdt = trading_conf.get("margin_per_trade", 20.0)
                     quantity = (margin_usdt * leverage) / price
 
                     logger.info(

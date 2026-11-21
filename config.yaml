@@ -56,7 +56,8 @@ pairlists:
 
 trading:
   margin_per_trade: 20.0
-  leverage: 10
+  leverage: 5
+  use_full_balance: true
 
 internals:
   process_throttle_secs: 5

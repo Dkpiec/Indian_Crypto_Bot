@@ -46,6 +46,7 @@ class TelegramRPC:
                 "blacklist": self.cmd_blacklist,
                 "help": self.cmd_help,
                 "version": self.cmd_version,
+                "trade_now": self.cmd_trade_now,
             }
 
             for cmd_name, handler in commands.items():
@@ -245,9 +246,40 @@ class TelegramRPC:
             "/reload\\_conf - Reload config\n"
             "/whitelist - Active pairs\n"
             "/blacklist - Blacklisted pairs\n"
+            "/trade\\_now - Enter nearest signal\n"
             "/version - Bot version"
         )
         await update.message.reply_text(text, parse_mode="Markdown")
+
+    async def cmd_trade_now(self, update, context) -> None:
+        """Manually enter on the most recent entry signal across all pairs."""
+        worker = self.bot_worker
+        if not worker:
+            await update.message.reply_text("❌ Bot not initialized", parse_mode="Markdown")
+            return
+        await update.message.reply_text("🔍 *Scanning all pairs for nearest entry signal...*", parse_mode="Markdown")
+        try:
+            result = worker.trade_now()
+            if result["success"]:
+                text = (
+                    f"📈 *TRADE NOW EXECUTED*\n"
+                    f"Pair: `{result['pair']}`\n"
+                    f"Price: `{result['price']:.6f}`\n"
+                    f"Qty: `{result['quantity']:.4f}`\n"
+                    f"Margin: `{result['margin_usdt']:.2f} USDT`\n"
+                    f"Leverage: `{result['leverage']}x`\n"
+                    f"Signal: `{result['tag']}`"
+                )
+                await update.message.reply_text(text, parse_mode="Markdown")
+            else:
+                pair_info = f" (`{result.get('pair', '')}`)" if result.get("pair") else ""
+                await update.message.reply_text(
+                    f"⚠️ *Trade Now Failed*{pair_info}\n`{result['reason'][:300]}`",
+                    parse_mode="Markdown",
+                )
+        except Exception as e:
+            logger.error(f"/trade_now failed: {e}", exc_info=True)
+            await update.message.reply_text(f"❌ *Error:* `{str(e)[:300]}`", parse_mode="Markdown")
 
     async def cmd_version(self, update, context) -> None:
         await update.message.reply_text(f"*Indian Crypto Bot* v{__version__}", parse_mode="Markdown")
