@@ -22,7 +22,7 @@ class TelegramRPC:
         self._app = None
 
     async def start(self) -> None:
-        """Start the Telegram polling loop."""
+        """Start the Telegram polling loop (non-blocking)."""
         try:
             from telegram.ext import ApplicationBuilder, CommandHandler
 
@@ -51,17 +51,12 @@ class TelegramRPC:
             for cmd_name, handler in commands.items():
                 self._app.add_handler(CommandHandler(cmd_name, handler))
 
-            # Python 20.0 API: start_polling is called on the application directly.
-            # In v19 the updater was public (app.updater.start_polling());
-            # in v20+ the updater is private and start_polling() is on Application.
-            if hasattr(self._app, "start_polling"):
-                await self._app.start_polling(drop_pending_updates=True)
-            else:
-                await self._app.initialize()
-                await self._app.start()
-                updater = getattr(self._app, "updater", None)
-                if updater is not None:
-                    await updater.start_polling(drop_pending_updates=True)
+            # python-telegram-bot v22+: initialize + start + updater.start_polling
+            # run_polling() is blocking and would prevent the worker loop from running.
+            await self._app.initialize()
+            await self._app.start()
+            if self._app.updater is not None:
+                await self._app.updater.start_polling(drop_pending_updates=True)
             logger.info("Telegram RPC started, polling for commands")
 
         except ImportError:
