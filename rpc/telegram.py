@@ -158,7 +158,67 @@ class TelegramRPC:
         await update.message.reply_text("🟢 *Use /reload_conf to restart with current config*", parse_mode="Markdown")
 
     async def cmd_reload_conf(self, update, context) -> None:
-        await update.message.reply_text("*Config reload:* Not yet implemented in v1.0", parse_mode="Markdown")
+        """Reload config from disk and apply updated trading parameters."""
+        worker = self.bot_worker
+        if not worker:
+            await update.message.reply_text("❌ Bot not initialized", parse_mode="Markdown")
+            return
+        try:
+            from config.loader import load_config
+            new_config = load_config()
+
+            # Update trading params
+            trading = new_config.get("trading", {})
+            old_margin = worker.config.get("trading", {}).get("margin_per_trade", 20.0)
+            old_leverage = worker.config.get("trading", {}).get("leverage", 10)
+            new_margin = trading.get("margin_per_trade", old_margin)
+            new_leverage = trading.get("leverage", old_leverage)
+
+            # Update pairlist
+            old_pairs = list(worker.pairs)
+            new_pairlists = new_config.get("pairlists", [])
+            new_pairs = []
+            for pl in new_pairlists:
+                new_pairs.extend(pl.get("pairs", []))
+            if new_pairs:
+                worker.pairs = new_pairs
+
+            # Update strategy params
+            strat_conf = new_config.get("strategy", {})
+            for key in ("timeframe", "max_open_trades", "stake_currency", "stoploss"):
+                if key in strat_conf:
+                    setattr(worker.strategy, key, strat_conf[key])
+
+            # Store updated config on worker
+            worker.config = new_config
+
+            changes = []
+            if new_margin != old_margin:
+                changes.append(f"margin: {old_margin}→{new_margin}")
+            if new_leverage != old_leverage:
+                changes.append(f"leverage: {old_leverage}→{new_leverage}")
+            if new_pairs != old_pairs:
+                changes.append(f"pairs: {len(old_pairs)}→{len(new_pairs)}")
+
+            summary = ", ".join(changes) if changes else "no changes detected"
+            pairs_preview = ", ".join(worker.pairs[:5])
+            if len(worker.pairs) > 5:
+                pairs_preview += f" (+{len(worker.pairs)-5} more)"
+
+            text = (
+                f"✅ *Config Reloaded*\n"
+                f"Changes: `{summary}`\n"
+                f"Margin: `{new_margin} USDT`\n"
+                f"Leverage: `{new_leverage}x`\n"
+                f"Pairs ({len(worker.pairs)}): `{pairs_preview}`\n"
+                f"Strategy: `{worker.strategy.name}` @ `{worker.strategy.timeframe}`"
+            )
+            logger.info(f"Config reloaded: {summary}")
+            await update.message.reply_text(text, parse_mode="Markdown")
+
+        except Exception as e:
+            logger.error(f"Config reload failed: {e}", exc_info=True)
+            await update.message.reply_text(f"❌ *Config reload failed:*\n`{str(e)[:300]}`", parse_mode="Markdown")
 
     async def cmd_whitelist(self, update, context) -> None:
         worker = self.bot_worker
