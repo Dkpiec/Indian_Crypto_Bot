@@ -171,9 +171,10 @@ class TelegramRPC:
             # Update trading params
             trading = new_config.get("trading", {})
             old_margin = worker.config.get("trading", {}).get("margin_per_trade", 20.0)
-            old_leverage = worker.config.get("trading", {}).get("leverage", 10)
+            old_leverage = worker.config.get("trading", {}).get("leverage", 5)
             new_margin = trading.get("margin_per_trade", old_margin)
             new_leverage = trading.get("leverage", old_leverage)
+            use_full_balance = trading.get("use_full_balance", False)
 
             # Update pairlist
             old_pairs = list(worker.pairs)
@@ -206,11 +207,18 @@ class TelegramRPC:
             if len(worker.pairs) > 5:
                 pairs_preview += f" (+{len(worker.pairs)-5} more)"
 
+            if use_full_balance:
+                balance = worker.wallets.get_total("USDT")
+                margin_display = f"Full Balance ({balance:.2f} USDT)"
+            else:
+                margin_display = f"{new_margin} USDT"
+
             text = (
                 f"✅ *Config Reloaded*\n"
                 f"Changes: `{summary}`\n"
-                f"Margin: `{new_margin} USDT`\n"
+                f"Margin: `{margin_display}`\n"
                 f"Leverage: `{new_leverage}x`\n"
+                f"Full Balance Mode: `{use_full_balance}`\n"
                 f"Pairs ({len(worker.pairs)}): `{pairs_preview}`\n"
                 f"Strategy: `{worker.strategy.name}` @ `{worker.strategy.timeframe}`"
             )

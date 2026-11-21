@@ -30,7 +30,7 @@ class PapiClient:
     PAPI_BASE = "https://papi.binance.com/papi/v1"
     FAPI_BASE = "https://fapi.binance.com/fapi/v1"
 
-    # Endpoints that exist ONLY on papi (authenticated trading)
+    # Endpoints that exist ONLY on papi (authenticated trading/account)
     PAPI_ONLY_PATHS = {
         "/account",
         "/positionRisk",
@@ -178,12 +178,15 @@ class PapiClient:
         reduce_only: bool = False,
         new_client_order_id: Optional[str] = None,
     ) -> dict:
-        """POST /order (papi, signed) — place a new order."""
+        """POST /order (papi, signed) — place a new order.
+        Binance Portfolio Margin API requires positionSide=BOTH for
+        accounts with hedge mode disabled (the default for most papi accounts)."""
         params = {
             "symbol": symbol,
             "side": side.upper(),
             "type": order_type.upper(),
             "quantity": quantity,
+            "positionSide": "BOTH",
         }
         if price is not None:
             params["price"] = price
