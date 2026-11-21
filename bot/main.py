@@ -96,12 +96,22 @@ def main() -> None:
     if rpc_manager:
         rpc_manager.bot_worker = worker
 
-    # Run async Telegram RPC alongside sync worker loop
+    # Run async Telegram RPC alongside sync worker loop.
+    # worker.start() is blocking/sync, so it MUST run in a separate thread;
+    # otherwise it blocks the asyncio event loop and Telegram update callbacks
+    # (which are coroutines on that loop) can never be processed.
+    import threading
+
     async def run_with_telegram():
         if rpc_manager:
             await rpc_manager.start()
         try:
-            worker.start()  # Blocks until stopped
+            # Run blocking worker in a daemon thread so the event loop stays free
+            worker_thread = threading.Thread(target=worker.start, daemon=True)
+            worker_thread.start()
+            # Keep the event loop alive while the worker thread runs
+            while worker_thread.is_alive():
+                await asyncio.sleep(1)
         finally:
             if rpc_manager:
                 await rpc_manager.stop()
