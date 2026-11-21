@@ -7,9 +7,10 @@ echo "Time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 # Generate config.yaml from environment variables at runtime
 CONFIG_PATH="${CONFIG_PATH:-/app/config.yaml}"
 
-if [ ! -f "$CONFIG_PATH" ]; then
-    echo "Generating config.yaml from environment variables..."
-    cat > "$CONFIG_PATH" <<EOF
+# Always regenerate config from env vars to ensure credentials are injected
+# (the committed config.yaml has empty placeholders)
+echo "Generating config.yaml from environment variables..."
+cat > "$CONFIG_PATH" <<EOF
 exchange:
   name: binance
   api_key: "${BINANCE_API_KEY}"
@@ -42,9 +43,6 @@ dry_run: ${DRY_RUN:-false}
 dry_run_wallet: ${DRY_RUN_WALLET:-1000.0}
 EOF
     echo "Config generated at $CONFIG_PATH"
-else
-    echo "Using existing config at $CONFIG_PATH"
-fi
 
 # Validate required env vars for live trading
 if [ "${DRY_RUN:-false}" = "false" ]; then
