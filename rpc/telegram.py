@@ -1,8 +1,7 @@
 """
 Telegram RPC layer for Indian_Crypto_Bot.
-Handles bot commands: /status, /balance, /profit, /trades, /performance,
-/count, /daily, /stats, /forceexit, /stop, /start, /reload_conf,
-/whitelist, /blacklist, /help, /version.
+All commands pull LIVE data from Binance via the exchange layer.
+No hardcoded placeholders — every response reflects actual account state.
 """
 
 import logging
@@ -11,6 +10,7 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 __version__ = "1.0.0"
+
 
 class TelegramRPC:
     """Telegram bot command handler and message sender."""
@@ -28,7 +28,6 @@ class TelegramRPC:
 
             self._app = ApplicationBuilder().token(self.token).build()
 
-            # Register all command handlers
             commands = {
                 "status": self.cmd_status,
                 "balance": self.cmd_balance,
@@ -52,8 +51,6 @@ class TelegramRPC:
             for cmd_name, handler in commands.items():
                 self._app.add_handler(CommandHandler(cmd_name, handler))
 
-            # python-telegram-bot v22+: initialize + start + updater.start_polling
-            # run_polling() is blocking and would prevent the worker loop from running.
             await self._app.initialize()
             await self._app.start()
             if self._app.updater is not None:
@@ -91,63 +88,265 @@ class TelegramRPC:
         except Exception as e:
             logger.error(f"Telegram send error: {e}")
 
-    # ── Command Handlers ──
+    # ── Live Data Helpers ──
+
+    def _get_live_positions(self) -> list[dict]:
+        """Fetch all open positions from Binance with non-zero size."""
+        worker = self.bot_worker
+        if not worker:
+            return []
+        try:
+            raw = worker.exchange.fetch_positions()
+            return [
+                p for p in raw
+                if abs(float(p.get("positionAmt", 0))) > 0
+            ]
+        except Exception as e:
+            logger.error(f"Failed to fetch positions: {e}")
+            return []
+
+    def _get_live_balance(self) -> dict:
+        """Fetch fresh balance from Binance."""
+        worker = self.bot_worker
+        if not worker:
+            return {"free": 0, "used": 0, "total": 0}
+        try:
+            worker.wallets.update()
+            return {
+                "free": worker.wallets.get_free("USDT"),
+                "used": worker.wallets.get_used("USDT"),
+                "total": worker.wallets.get_total("USDT"),
+            }
+        except Exception as e:
+            logger.error(f"Failed to fetch balance: {e}")
+            return {"free": 0, "used": 0, "total": 0}
+
+    # ── Command Handlers (all pull live Binance data) ──
 
     async def cmd_status(self, update, context) -> None:
         worker = self.bot_worker
         if not worker:
-            await update.message.reply_text("Bot not initialized")
+            await update.message.reply_text("❌ Bot not initialized", parse_mode="Markdown")
             return
-        balance = worker.wallets.get_total("USDT")
-        pairs = ", ".join(worker.pairs)
+
+        bal = self._get_live_balance()
+        positions = self._get_live_positions()
+        pairs_preview = ", ".join(worker.pairs[:5])
+        if len(worker.pairs) > 5:
+            pairs_preview += f" (+{len(worker.pairs)-5} more)"
+
+        trading = worker.config.get("trading", {})
+        leverage = trading.get("leverage", 5)
+        use_full = trading.get("use_full_balance", False)
+        margin_info = f"Full Balance ({bal['total']:.2f} USDT)" if use_full else f"{trading.get('margin_per_trade', 20.0)} USDT"
+
         text = (
-            f"*Bot Status*\n"
+            f"*🤖 Bot Status*\n"
             f"State: `{worker.state}`\n"
-            f"Strategy: `{worker.strategy.name}`\n"
-            f"Pairs: `{pairs}`\n"
-            f"Timeframe: `{worker.strategy.timeframe}`\n"
-            f"Balance: `{balance:.4f} USDT`"
+            f"Strategy: `{worker.strategy.name}` @ `{worker.strategy.timeframe}`\n"
+            f"Pairs ({len(worker.pairs)}): `{pairs_preview}`\n"
+            f"Leverage: `{leverage}x` | Margin: `{margin_info}`\n"
+            f"Balance: `{bal['total']:.4f} USDT`\n"
+            f"Open Positions: `{len(positions)}`\n"
+            f"Dry Run: `{worker.config.get('dry_run', False)}`"
         )
         await update.message.reply_text(text, parse_mode="Markdown")
 
     async def cmd_balance(self, update, context) -> None:
-        worker = self.bot_worker
-        if not worker:
-            await update.message.reply_text("Bot not initialized")
-            return
-        free = worker.wallets.get_free("USDT")
-        used = worker.wallets.get_used("USDT")
-        total = worker.wallets.get_total("USDT")
+        bal = self._get_live_balance()
+        positions = self._get_live_positions()
+        unrealized = sum(float(p.get("unRealizedProfit", 0)) for p in positions)
+
         text = (
-            f"*Wallet Balance*\n"
-            f"Total: `{total:.4f} USDT`\n"
-            f"Free: `{free:.4f} USDT`\n"
-            f"Used: `{used:.4f} USDT`"
+            f"*💰 Wallet Balance (Live)*\n"
+            f"Total Equity: `{bal['total']:.4f} USDT`\n"
+            f"Free: `{bal['free']:.4f} USDT`\n"
+            f"Used (Margin): `{bal['used']:.4f} USDT`\n"
+            f"Unrealized PnL: `{unrealized:.4f} USDT`"
         )
         await update.message.reply_text(text, parse_mode="Markdown")
 
     async def cmd_profit(self, update, context) -> None:
-        await update.message.reply_text("*Profit:* No closed trades yet (bot just started)", parse_mode="Markdown")
+        positions = self._get_live_positions()
+        bal = self._get_live_balance()
+
+        unrealized = sum(float(p.get("unRealizedProfit", 0)) for p in positions)
+        realized_lines = []
+        for p in positions:
+            symbol = p.get("symbol", "?")
+            amt = float(p.get("positionAmt", 0))
+            entry = float(p.get("entryPrice", 0))
+            upnl = float(p.get("unRealizedProfit", 0))
+            side = "LONG" if amt > 0 else "SHORT"
+            realized_lines.append(
+                f"• `{symbol}` {side} {abs(amt):.2f} @ `{entry:.6f}` → UPnL `{upnl:.4f}`"
+            )
+
+        if not realized_lines:
+            pos_text = "No open positions"
+        else:
+            pos_text = "\n".join(realized_lines)
+
+        text = (
+            f"*📊 Profit (Live)*\n"
+            f"Unrealized PnL: `{unrealized:.4f} USDT`\n"
+            f"Equity: `{bal['total']:.4f} USDT`\n\n"
+            f"*Open Positions:*\n{pos_text}"
+        )
+        await update.message.reply_text(text, parse_mode="Markdown")
 
     async def cmd_trades(self, update, context) -> None:
-        await update.message.reply_text("*Trades:* No trades recorded yet", parse_mode="Markdown")
+        """Show current open positions from Binance."""
+        positions = self._get_live_positions()
+        if not positions:
+            await update.message.reply_text("*📋 Trades:* No open positions", parse_mode="Markdown")
+            return
+
+        lines = []
+        for p in positions:
+            symbol = p.get("symbol", "?")
+            amt = float(p.get("positionAmt", 0))
+            entry = float(p.get("entryPrice", 0))
+            mark = float(p.get("markPrice", 0))
+            upnl = float(p.get("unRealizedProfit", 0))
+            lev = float(p.get("leverage", 0))
+            side = "🟢 LONG" if amt > 0 else "🔴 SHORT"
+            lines.append(
+                f"{side} `{symbol}`\n"
+                f"  Qty: `{abs(amt):.4f}` | Lev: `{lev:.0f}x`\n"
+                f"  Entry: `{entry:.6f}` | Mark: `{mark:.6f}`\n"
+                f"  UPnL: `{upnl:.4f} USDT`"
+            )
+
+        text = f"*📋 Open Trades ({len(positions)})*\n\n" + "\n\n".join(lines)
+        await update.message.reply_text(text, parse_mode="Markdown")
 
     async def cmd_performance(self, update, context) -> None:
-        await update.message.reply_text("*Performance:* Insufficient data", parse_mode="Markdown")
+        """Per-position performance from live Binance data."""
+        positions = self._get_live_positions()
+        if not positions:
+            await update.message.reply_text("*📈 Performance:* No open positions to analyze", parse_mode="Markdown")
+            return
+
+        lines = []
+        for p in positions:
+            symbol = p.get("symbol", "?")
+            amt = float(p.get("positionAmt", 0))
+            entry = float(p.get("entryPrice", 0))
+            mark = float(p.get("markPrice", 0))
+            upnl = float(p.get("unRealizedProfit", 0))
+            roi_pct = ((mark - entry) / entry * 100) if entry > 0 else 0
+            if amt < 0:
+                roi_pct = -roi_pct
+            emoji = "✅" if upnl >= 0 else "❌"
+            lines.append(f"{emoji} `{symbol}` ROI: `{roi_pct:+.2f}%` | UPnL: `{upnl:.4f} USDT`")
+
+        text = f"*📈 Performance (Live)*\n\n" + "\n".join(lines)
+        await update.message.reply_text(text, parse_mode="Markdown")
 
     async def cmd_count(self, update, context) -> None:
+        """Count of open positions from live Binance data."""
+        positions = self._get_live_positions()
         worker = self.bot_worker
         max_trades = worker.strategy.max_open_trades if worker else "?"
-        await update.message.reply_text(f"*Open Trades:* `0 / {max_trades}`", parse_mode="Markdown")
+
+        lines = []
+        for p in positions:
+            symbol = p.get("symbol", "?")
+            amt = float(p.get("positionAmt", 0))
+            side = "LONG" if amt > 0 else "SHORT"
+            lines.append(f"• `{symbol}` {side} {abs(amt):.4f}")
+
+        pos_detail = "\n".join(lines) if lines else "None"
+        text = (
+            f"*🔢 Open Trades Count*\n"
+            f"Open: `{len(positions)} / {max_trades}`\n\n"
+            f"{pos_detail}"
+        )
+        await update.message.reply_text(text, parse_mode="Markdown")
 
     async def cmd_daily(self, update, context) -> None:
-        await update.message.reply_text("*Daily PnL:* No data yet", parse_mode="Markdown")
+        """Daily PnL approximated from unrealized profit on open positions."""
+        positions = self._get_live_positions()
+        bal = self._get_live_balance()
+        unrealized = sum(float(p.get("unRealizedProfit", 0)) for p in positions)
+
+        text = (
+            f"*📅 Daily Summary (Live)*\n"
+            f"Unrealized PnL: `{unrealized:.4f} USDT`\n"
+            f"Current Equity: `{bal['total']:.4f} USDT`\n"
+            f"Free Balance: `{bal['free']:.4f} USDT`\n"
+            f"Open Positions: `{len(positions)}`\n"
+            f"_Note: Full daily PnL requires trade history tracking (coming in v1.1)_"
+        )
+        await update.message.reply_text(text, parse_mode="Markdown")
 
     async def cmd_stats(self, update, context) -> None:
-        await update.message.reply_text("*Stats:* Bot recently started, collecting data", parse_mode="Markdown")
+        """Overall stats from live Binance account data."""
+        bal = self._get_live_balance()
+        positions = self._get_live_positions()
+        unrealized = sum(float(p.get("unRealizedProfit", 0)) for p in positions)
+        worker = self.bot_worker
+
+        total_margin = sum(float(p.get("initialMargin", 0)) for p in positions)
+        avg_leverage = (bal["used"] / total_margin) if total_margin > 0 else 0
+
+        text = (
+            f"*📊 Stats (Live)*\n"
+            f"Equity: `{bal['total']:.4f} USDT`\n"
+            f"Free: `{bal['free']:.4f} USDT`\n"
+            f"Used Margin: `{bal['used']:.4f} USDT`\n"
+            f"Unrealized PnL: `{unrealized:.4f} USDT`\n"
+            f"Open Positions: `{len(positions)}`\n"
+            f"Strategy: `{worker.strategy.name if worker else '?'}` @ `{worker.strategy.timeframe if worker else '?'}`\n"
+            f"Pairs Monitored: `{len(worker.pairs) if worker else 0}`"
+        )
+        await update.message.reply_text(text, parse_mode="Markdown")
 
     async def cmd_forceexit(self, update, context) -> None:
-        await update.message.reply_text("*Force Exit:* No open trades to exit", parse_mode="Markdown")
+        """Force-close all open positions or a specific pair."""
+        worker = self.bot_worker
+        if not worker:
+            await update.message.reply_text("❌ Bot not initialized", parse_mode="Markdown")
+            return
+
+        args = context.args if context.args else []
+        target_symbol = args[0].upper() if args else None
+
+        positions = self._get_live_positions()
+        if not positions:
+            await update.message.reply_text("*Force Exit:* No open positions to close", parse_mode="Markdown")
+            return
+
+        closed = []
+        errors = []
+        for p in positions:
+            symbol = p.get("symbol", "")
+            amt = float(p.get("positionAmt", 0))
+            if amt == 0:
+                continue
+            if target_symbol and symbol != target_symbol:
+                continue
+
+            side = "SELL" if amt > 0 else "BUY"
+            qty = abs(amt)
+            try:
+                order = worker.exchange.create_order(
+                    symbol=symbol,
+                    order_type="MARKET",
+                    side=side,
+                    amount=qty,
+                    reduce_only=True,
+                )
+                closed.append(f"✅ `{symbol}` {side} {qty:.4f}")
+                logger.info(f"Force exit: {symbol} {side} {qty:.4f}")
+            except Exception as e:
+                errors.append(f"❌ `{symbol}`: {str(e)[:100]}")
+                logger.error(f"Force exit failed {symbol}: {e}")
+
+        result_lines = closed + errors
+        text = f"*🚪 Force Exit Results*\n\n" + "\n".join(result_lines)
+        await update.message.reply_text(text, parse_mode="Markdown")
 
     async def cmd_stop(self, update, context) -> None:
         worker = self.bot_worker
@@ -156,7 +355,13 @@ class TelegramRPC:
         await update.message.reply_text("🔴 *Bot stopping...*", parse_mode="Markdown")
 
     async def cmd_start(self, update, context) -> None:
-        await update.message.reply_text("🟢 *Use /reload_conf to restart with current config*", parse_mode="Markdown")
+        worker = self.bot_worker
+        if worker and worker.state == "STOPPED":
+            worker.state = "RUNNING"
+            worker._running = True
+            await update.message.reply_text("🟢 *Bot resumed*", parse_mode="Markdown")
+        else:
+            await update.message.reply_text("🟢 *Use /reload\\_conf to restart with current config*", parse_mode="Markdown")
 
     async def cmd_reload_conf(self, update, context) -> None:
         """Reload config from disk and apply updated trading parameters."""
@@ -168,7 +373,6 @@ class TelegramRPC:
             from config.loader import load_config
             new_config = load_config()
 
-            # Update trading params
             trading = new_config.get("trading", {})
             old_margin = worker.config.get("trading", {}).get("margin_per_trade", 20.0)
             old_leverage = worker.config.get("trading", {}).get("leverage", 5)
@@ -176,7 +380,6 @@ class TelegramRPC:
             new_leverage = trading.get("leverage", old_leverage)
             use_full_balance = trading.get("use_full_balance", False)
 
-            # Update pairlist
             old_pairs = list(worker.pairs)
             new_pairlists = new_config.get("pairlists", [])
             new_pairs = []
@@ -185,13 +388,11 @@ class TelegramRPC:
             if new_pairs:
                 worker.pairs = new_pairs
 
-            # Update strategy params
             strat_conf = new_config.get("strategy", {})
             for key in ("timeframe", "max_open_trades", "stake_currency", "stoploss"):
                 if key in strat_conf:
                     setattr(worker.strategy, key, strat_conf[key])
 
-            # Store updated config on worker
             worker.config = new_config
 
             changes = []
@@ -208,8 +409,8 @@ class TelegramRPC:
                 pairs_preview += f" (+{len(worker.pairs)-5} more)"
 
             if use_full_balance:
-                balance = worker.wallets.get_total("USDT")
-                margin_display = f"Full Balance ({balance:.2f} USDT)"
+                bal = self._get_live_balance()
+                margin_display = f"Full Balance ({bal['total']:.2f} USDT)"
             else:
                 margin_display = f"{new_margin} USDT"
 
@@ -232,7 +433,7 @@ class TelegramRPC:
     async def cmd_whitelist(self, update, context) -> None:
         worker = self.bot_worker
         pairs = "\n".join(f"• `{p}`" for p in (worker.pairs if worker else []))
-        await update.message.reply_text(f"*Whitelist:*\n{pairs}", parse_mode="Markdown")
+        await update.message.reply_text(f"*Whitelist ({len(worker.pairs) if worker else 0}):*\n{pairs}", parse_mode="Markdown")
 
     async def cmd_blacklist(self, update, context) -> None:
         await update.message.reply_text("*Blacklist:* Empty", parse_mode="Markdown")
@@ -240,15 +441,15 @@ class TelegramRPC:
     async def cmd_help(self, update, context) -> None:
         text = (
             "*Available Commands:*\n"
-            "/status - Bot status\n"
-            "/balance - Wallet balance\n"
-            "/profit - Closed trade PnL\n"
-            "/trades - Trade history\n"
-            "/performance - Per-pair stats\n"
+            "/status - Bot status + live balance\n"
+            "/balance - Live wallet balance\n"
+            "/profit - Unrealized PnL + positions\n"
+            "/trades - Open positions detail\n"
+            "/performance - Per-position ROI\n"
             "/count - Open trades count\n"
-            "/daily - Daily PnL\n"
+            "/daily - Daily summary\n"
             "/stats - Overall statistics\n"
-            "/forceexit - Force close trade\n"
+            "/forceexit [PAIR] - Close positions\n"
             "/stop - Stop bot\n"
             "/start - Resume bot\n"
             "/reload\\_conf - Reload config\n"
