@@ -28,22 +28,27 @@ class PapiClient:
     """
 
     PAPI_BASE = "https://papi.binance.com/papi/v1"
+    # USDT-M futures under portfolio margin use /papi/v1/um/* sub-path
+    PAPI_UM_BASE = "https://papi.binance.com/papi/v1/um"
     FAPI_BASE = "https://fapi.binance.com/fapi/v1"
 
-    # Endpoints that exist ONLY on papi (authenticated account/position queries)
-    # Note: order placement goes through fapi — papi /order returns 404 for
-    # symbols not explicitly enabled in the portfolio margin account config.
-    PAPI_ONLY_PATHS = {
+    # Endpoints routed to papi root (/papi/v1/*) — account-level queries
+    PAPI_ROOT_PATHS = {
         "/account",
+    }
+
+    # Endpoints routed to papi UM sub-path (/papi/v1/um/*) — USDT-M futures trading
+    PAPI_UM_PATHS = {
+        "/order",
+        "/openOrders",
         "/positionRisk",
     }
 
-    # Endpoints that exist ONLY on fapi (public market data AND order execution)
+    # Endpoints that exist ONLY on fapi (public market data)
     FAPI_ONLY_PATHS = {
         "/klines",
         "/ticker/price",
         "/ticker/24hr",
-        "/order",
     }
 
     # Endpoints that don't exist on papi for portfolio margin accounts — mock them
@@ -66,11 +71,13 @@ class PapiClient:
 
     def _route_base_url(self, path: str) -> str:
         """Route to correct base URL based on endpoint type."""
-        if path in self.PAPI_ONLY_PATHS:
+        if path in self.PAPI_UM_PATHS:
+            return self.PAPI_UM_BASE
+        if path in self.PAPI_ROOT_PATHS:
             return self.PAPI_BASE
         if path in self.FAPI_ONLY_PATHS:
             return self.FAPI_BASE
-        # Default: try papi first for authenticated, fapi for public
+        # Default: papi root for unknown authenticated endpoints
         return self.PAPI_BASE
 
     def signed_request(
