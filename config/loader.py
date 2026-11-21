@@ -139,9 +139,9 @@ def _validate_config(config: dict) -> None:
         if not exchange.get("secret_key"):
             errors.append("exchange.secret_key is required for live trading")
 
-    # Telegram (required if enabled)
+    # Telegram (required if enabled and not dry_run)
     telegram = config.get("telegram", {})
-    if telegram.get("enabled", True):
+    if not config.get("dry_run", False) and telegram.get("enabled", True):
         if not telegram.get("token"):
             errors.append("telegram.token is required when telegram is enabled")
         if not telegram.get("chat_id"):

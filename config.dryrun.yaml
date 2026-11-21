@@ -1,0 +1,28 @@
+exchange:
+  name: binance
+  api_key: ""
+  secret_key: ""
+  trading_mode: futures
+  margin_mode: cross
+
+telegram:
+  enabled: false
+
+strategy:
+  name: ATR_CHANNEL_2H
+  timeframe: 2h
+  max_open_trades: 4
+  stake_currency: USDT
+  stoploss: -0.99
+
+pairlists:
+  - method: StaticPairList
+    pairs:
+      - TRX/USDT:USDT
+
+internals:
+  process_throttle_secs: 5
+  heartbeat_interval: 60
+
+dry_run: true
+dry_run_wallet: 1000.0

@@ -11,7 +11,8 @@ from typing import Type
 
 logger = logging.getLogger(__name__)
 
-STRATEGIES_DIR = Path(__file__).parent.parent.parent / "strategies"
+# Resolve strategies/ relative to project root (one level up from strategy/)
+STRATEGIES_DIR = Path(__file__).resolve().parent.parent / "strategies"
 
 
 def load_strategy(name: str) -> Type:
