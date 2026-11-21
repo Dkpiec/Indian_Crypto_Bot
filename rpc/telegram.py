@@ -55,7 +55,7 @@ class TelegramRPC:
             # In v19 the updater was public (app.updater.start_polling());
             # in v20+ the updater is private and start_polling() is on Application.
             if hasattr(self._app, "start_polling"):
-                await self._app.start_polling(drop_updates=True)
+                await self._app.start_polling(drop_pending_updates=True)
             else:
                 await self._app.initialize()
                 await self._app.start()
