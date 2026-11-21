@@ -149,9 +149,33 @@ class PapiClient:
         return self.signed_request("GET", "/account", signed=True)
 
     def get_position_risk(self, symbol: Optional[str] = None) -> list:
-        """GET /positionRisk (papi, signed) — returns open positions."""
+        """GET /um/positionRisk (papi UM sub-path, signed) — returns open USDT-M positions.
+        Portfolio Margin accounts store positions under /papi/v1/um/*, not /papi/v1/*."""
         params = {"symbol": symbol} if symbol else {}
-        return self.signed_request("GET", "/positionRisk", params=params, signed=True)
+        # Route directly to UM sub-path instead of relying on _route_base_url
+        # because positionRisk exists on both root (empty for PM) and UM (actual data)
+        url = f"{self.PAPI_UM_BASE}/positionRisk"
+        import time as _time
+        from urllib.parse import urlencode
+        import hmac as _hmac
+        import hashlib as _hashlib
+        params["timestamp"] = str(int(_time.time() * 1000))
+        params["recvWindow"] = str(self.recv_window)
+        qs = urlencode(params)
+        secret = self.secret_key if isinstance(self.secret_key, bytes) else self.secret_key.encode()
+        sig = _hmac.new(secret, qs.encode(), _hashlib.sha256).hexdigest()
+        params["signature"] = sig
+        try:
+            resp = self.session.get(url, params=params, timeout=30)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            logger.error(f"Request failed: GET /um/positionRisk status={status}: {e}")
+            raise
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request error: GET /um/positionRisk: {e}")
+            raise
 
     def get_klines(
         self,
