@@ -1,6 +1,6 @@
 """
 High-level Binance papi exchange interface.
-Wraps PapiClient with freqtrade-compatible method signatures.
+Wraps PapiClient with standardized method signatures.
 All methods speak papi natively — no CCXT, no fapi.
 """
 
@@ -164,7 +164,7 @@ class BinancePapiExchange:
 
     @staticmethod
     def _to_papi_interval(timeframe: str) -> str:
-        """Convert freqtrade timeframe strings to papi kline intervals."""
+        """Convert timeframe strings to papi kline intervals."""
         mapping = {
             "1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m",
             "30m": "30m", "1h": "1h", "2h": "2h", "4h": "4h",

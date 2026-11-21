@@ -51,11 +51,18 @@ class TelegramRPC:
             for cmd_name, handler in commands.items():
                 self._app.add_handler(CommandHandler(cmd_name, handler))
 
-            await self._app.initialize()
-            await self._app.start()
-            if self._app.updater is not None:
-                await self._app.updater.start_polling(drop_pending_updates=True)
-            logger.info("Telegram RPC started, listening for commands")
+            # Python 20.0 API: start_polling is called on the application directly.
+            # In v19 the updater was public (app.updater.start_polling());
+            # in v20+ the updater is private and start_polling() is on Application.
+            if hasattr(self._app, "start_polling"):
+                await self._app.start_polling(drop_updates=True)
+            else:
+                await self._app.initialize()
+                await self._app.start()
+                updater = getattr(self._app, "updater", None)
+                if updater is not None:
+                    await updater.start_polling(drop_updates=True)
+            logger.info("Telegram RPC started, polling for commands")
 
         except ImportError:
             logger.error("python-telegram-bot not installed; Telegram RPC disabled")
@@ -65,11 +72,12 @@ class TelegramRPC:
     async def stop(self) -> None:
         """Stop the Telegram polling loop."""
         if self._app is not None:
-            if self._app.updater is not None:
-                await self._app.updater.stop()
-            await self._app.stop()
-            await self._app.shutdown()
-            logger.info("Telegram RPC stopped")
+            try:
+                await self._app.stop()
+                await self._app.shutdown()
+                logger.info("Telegram RPC stopped")
+            except Exception as e:
+                logger.error(f"Error stopping Telegram RPC: {e}")
 
     def send_message(self, text: str) -> None:
         """Send a message to the configured chat (sync wrapper for non-async contexts)."""

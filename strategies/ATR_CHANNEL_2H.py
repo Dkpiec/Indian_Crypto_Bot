@@ -1,6 +1,6 @@
 """
 ATR_CHANNEL_2H Strategy for Indian_Crypto_Bot.
-Ported from freqtrade ATR_CHANNEL_2H with identical logic.
+ATR channel breakout strategy on 2h timeframe.
 Uses ATR-based channel breakout for entry/exit signals on 2h timeframe.
 """
 
