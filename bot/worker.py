@@ -148,24 +148,72 @@ class BotWorker:
                             self.rpc_manager.send_message(f"⚠️ *Entry Blocked* `{pair}`\n{reason}")
                         continue
 
-                    logger.info(f"ENTRY signal on {pair}: {latest.get('enter_tag', 'unknown')}")
-                    if self.rpc_manager:
-                        price = latest["close"]
-                        self.rpc_manager.send_message(
-                            f"📈 *Entry Signal* `{pair}`\n"
-                            f"Price: `{price:.6f}`\n"
-                            f"Tag: `{latest.get('enter_tag', '')}`"
+                    price = latest["close"]
+                    margin_usdt = self.config.get("trading", {}).get("margin_per_trade", 20.0)
+                    leverage = self.config.get("trading", {}).get("leverage", 10)
+                    quantity = (margin_usdt * leverage) / price
+
+                    logger.info(
+                        f"ENTRY signal on {pair}: {latest.get('enter_tag', 'unknown')} "
+                        f"| margin={margin_usdt} USDT | qty={quantity:.4f}"
+                    )
+
+                    try:
+                        order = self.exchange.create_order(
+                            symbol=pair,
+                            order_type="MARKET",
+                            side="BUY",
+                            amount=quantity,
                         )
+                        logger.info(f"ORDER PLACED: {order}")
+                        if self.rpc_manager:
+                            self.rpc_manager.send_message(
+                                f"📈 *ENTRY EXECUTED* `{pair}`\n"
+                                f"Price: `{price:.6f}`\n"
+                                f"Qty: `{quantity:.4f}`\n"
+                                f"Margin: `{margin_usdt} USDT`\n"
+                                f"Leverage: `{leverage}x`\n"
+                                f"Tag: `{latest.get('enter_tag', '')}`"
+                            )
+                    except Exception as e:
+                        logger.error(f"ORDER FAILED on {pair}: {e}", exc_info=True)
+                        if self.rpc_manager:
+                            self.rpc_manager.send_message(f"❌ *Order Failed* `{pair}`\n`{str(e)[:200]}`")
 
                 if latest.get("exit_long", 0) == 1:
+                    price = latest["close"]
                     logger.info(f"EXIT signal on {pair}: {latest.get('exit_tag', 'unknown')}")
-                    if self.rpc_manager:
-                        price = latest["close"]
-                        self.rpc_manager.send_message(
-                            f"📉 *Exit Signal* `{pair}`\n"
-                            f"Price: `{price:.6f}`\n"
-                            f"Tag: `{latest.get('exit_tag', '')}`"
-                        )
+
+                    # Close position with market sell
+                    try:
+                        positions = self.exchange.fetch_positions(pair)
+                        pos_qty = 0.0
+                        for p in positions:
+                            amt = float(p.get("positionAmt", 0))
+                            if amt > 0:
+                                pos_qty += amt
+                        if pos_qty > 0:
+                            order = self.exchange.create_order(
+                                symbol=pair,
+                                order_type="MARKET",
+                                side="SELL",
+                                amount=pos_qty,
+                                reduce_only=True,
+                            )
+                            logger.info(f"EXIT ORDER PLACED: {order}")
+                            if self.rpc_manager:
+                                self.rpc_manager.send_message(
+                                    f"📉 *EXIT EXECUTED* `{pair}`\n"
+                                    f"Price: `{price:.6f}`\n"
+                                    f"Qty: `{pos_qty:.4f}`\n"
+                                    f"Tag: `{latest.get('exit_tag', '')}`"
+                                )
+                        else:
+                            logger.info(f"No open position to exit on {pair}")
+                    except Exception as e:
+                        logger.error(f"EXIT ORDER FAILED on {pair}: {e}", exc_info=True)
+                        if self.rpc_manager:
+                            self.rpc_manager.send_message(f"❌ *Exit Failed* `{pair}`\n`{str(e)[:200]}`")
 
             except Exception as e:
                 logger.error(f"Error processing {pair}: {e}", exc_info=True)

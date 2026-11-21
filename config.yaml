@@ -25,6 +25,10 @@ pairlists:
     pairs:
       - TRX/USDT:USDT
 
+trading:
+  margin_per_trade: 20.0
+  leverage: 10
+
 internals:
   process_throttle_secs: 5
   heartbeat_interval: 60
