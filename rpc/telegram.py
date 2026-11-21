@@ -61,7 +61,7 @@ class TelegramRPC:
                 await self._app.start()
                 updater = getattr(self._app, "updater", None)
                 if updater is not None:
-                    await updater.start_polling(drop_updates=True)
+                    await updater.start_polling(drop_pending_updates=True)
             logger.info("Telegram RPC started, polling for commands")
 
         except ImportError:
