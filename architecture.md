@@ -61,23 +61,33 @@ Indian_Crypto_Bot/
 
 ---
 
-## 3. Papi Exchange Layer (Core Differentiator)
+## 3. Exchange Layer (Dual-Endpoint Architecture)
 
-### 3.1 Why Not CCXT?
-CCXT's Binance implementation hardcodes `fapi.binance.com` URLs. The papi gateway uses different:
-- Base URL: `https://papi.binance.com/papi/v1/` (not `/fapi/v1/`)
-- Account endpoint: returns flat `{accountEquity, accountInitialMargin}` (not `{assets: [{walletBalance}]}`)
-- Some endpoints don't exist on papi (positionSide/dual, multiAssetsMargin, leverageBracket)
-- Auth signing is identical (HMAC-SHA256) but URL paths differ
+### 3.1 Why Dual Endpoints?
+**Phase 3 Bug Audit finding:** The papi gateway (`papi.binance.com/papi/v1/`) ONLY serves portfolio-margin authenticated endpoints (account, order management). Public market data endpoints (klines, ticker/price) return 404 on papi and MUST stay on fapi. Additionally, `positionRisk` and `openOrders` also 404 on papi for portfolio margin accounts and are mocked.
 
-### 3.2 PapiClient Design
+This means a pure-papi approach is impossible. The solution is **dual-endpoint routing** — no monkey-patching, just correct URL selection per endpoint type:
+- **PAPI** (`https://papi.binance.com/papi/v1`): `/account`, `/order`, `/cancelOrder`, `/getOrder`
+- **FAPI** (`https://fapi.binance.com/fapi/v1`): `/klines`, `/ticker/price`, `/ping` (unsigned)
+- **MOCKED**: `/positionSide/dual`, `/multiAssetsMargin`, `/leverageBracket`, `/positionRisk`, `/openOrders`
+
+### 3.2 PapiClient Design (Dual-Endpoint)
 ```python
 class PapiClient:
-    BASE_URL = "https://papi.binance.com/papi/v1"
+    PAPI_BASE = "https://papi.binance.com/papi/v1"  # Authenticated trading
+    FAPI_BASE = "https://fapi.binance.com/fapi/v1"  # Public market data
 
-    def __init__(self, api_key: str, secret_key: str):
-        self.api_key = api_key
-        self.secret_key = secret_key
+    def _route_base_url(self, path: str) -> str:
+        if path in self.PAPI_ONLY_PATHS:
+            return self.PAPI_BASE
+        if path in self.FAPI_ONLY_PATHS:
+            return self.FAPI_BASE
+        return self.PAPI_BASE  # default to papi for unknown
+
+    def signed_request(self, method, path, params=None, signed=True):
+        base_url = self._route_base_url(path)
+        # Sign only papi requests; fapi public endpoints are unsigned
+        ...
         self.session = requests.Session()
         self.rate_limiter = AdaptiveRateLimiter()
 
