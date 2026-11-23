@@ -74,6 +74,17 @@ class BotWorker:
         if not self.pairs:
             self.pairs = ["TRX/USDT:USDT"]
 
+        # Position-sizing knobs. max_open_trades caps how many concurrent
+        # positions the bot holds; when use_full_balance is set we split the
+        # equity across that many equal slots instead of putting the whole
+        # equity into every signal (the -2019 margin storm).
+        trading_conf = config.get("trading", {})
+        strategy_conf = config.get("strategy", {})
+        self.max_open_trades = int(
+            trading_conf.get("max_open_trades",
+                             strategy_conf.get("max_open_trades", 4))
+        )
+
         # Signal handlers for graceful shutdown
         signal.signal(signal.SIGTERM, self._handle_signal)
         signal.signal(signal.SIGINT, self._handle_signal)
@@ -82,6 +93,28 @@ class BotWorker:
         logger.info(f"Received signal {signum}, shutting down gracefully")
         self._running = False
         self.state = "STOPPED"
+
+    def _open_position_count(self) -> int:
+        """Number of currently open positions with non-zero contract size.
+
+        Reads the exchange's positionRisk; on any failure returns a large
+        number so we fail *closed* (no new entries) rather than open blind
+        when we can't see current exposure.
+        """
+        try:
+            positions = self.exchange.fetch_positions()
+            count = 0
+            for p in positions:
+                try:
+                    size = abs(float(p.get("positionAmt", 0) or 0))
+                    if size > 0:
+                        count += 1
+                except (TypeError, ValueError):
+                    continue
+            return count
+        except Exception as e:
+            logger.warning(f"Could not read open positions ({e}); failing closed.")
+            return 10**6
 
     def start(self) -> None:
         """Start the trading loop."""
@@ -194,13 +227,24 @@ class BotWorker:
         if not allowed:
             return {"success": False, "reason": f"Risk manager blocked: {reason}", "pair": best_pair}
 
-        # Execute market buy with full balance × leverage
+        # Execute market buy. Full-balance mode splits equity across the
+        # max_open_trades slots; the position cap is enforced before ordering.
         trading_conf = self.config.get("trading", {})
         leverage = trading_conf.get("leverage", 5)
         if trading_conf.get("use_full_balance", False):
-            margin_usdt = self.wallets.get_total("USDT")
+            slots = max(1, self.max_open_trades)
+            margin_usdt = self.wallets.get_total("USDT") / slots
         else:
             margin_usdt = trading_conf.get("margin_per_trade", 20.0)
+
+        open_pos = self._open_position_count()
+        if open_pos >= self.max_open_trades:
+            return {
+                "success": False,
+                "reason": f"At max_open_trades ({open_pos} open >= {self.max_open_trades}); no new entry",
+                "pair": best_pair,
+            }
+
         quantity = (margin_usdt * leverage) / best_price
 
         try:
@@ -296,10 +340,28 @@ class BotWorker:
                     price = float(last_closed["close"])
                     trading_conf = self.config.get("trading", {})
                     leverage = trading_conf.get("leverage", 5)
-                    if trading_conf.get("use_full_balance", False):
-                        margin_usdt = self.wallets.get_total("USDT")
+                    use_full_balance = trading_conf.get("use_full_balance", False)
+                    equity = self.wallets.get_total("USDT")
+                    if use_full_balance:
+                        # Split the whole equity across max_open_trades equal
+                        # slots instead of concentrating it into every signal —
+                        # that was the -2019 margin-insufficient storm.
+                        slots = max(1, self.max_open_trades)
+                        margin_usdt = equity / slots
                     else:
                         margin_usdt = trading_conf.get("margin_per_trade", 20.0)
+
+                    # Enforce the concurrent-position cap. When the slot is
+                    # already full, skip this entry (the signal will not be
+                    # retried on the same candle; it may re-fire next close).
+                    open_pos = self._open_position_count()
+                    if open_pos >= self.max_open_trades:
+                        logger.info(
+                            f"ENTRY on {pair} skipped: at max_open_trades "
+                            f"({open_pos} open >= {self.max_open_trades})."
+                        )
+                        continue
+
                     quantity = (margin_usdt * leverage) / price
                     max_qty = trading_conf.get("max_quantity_per_order")  # optional cap
                     if max_qty is not None and quantity > max_qty:
