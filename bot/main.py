@@ -74,14 +74,19 @@ def main() -> None:
         dry_run_wallet=config.get("dry_run_wallet", 1000.0),
     )
 
-    # 5. Initialize Telegram RPC
+    # 5. Initialize Telegram RPC — only when a token is actually present.
+    # An empty token must disable the RPC (trading continues) rather than
+    # constructing a TelegramRPC that raises on start() and takes the whole
+    # bot down with it.
     telegram_config = config.get("telegram", {})
     rpc_manager = None
-    if telegram_config.get("enabled", True):
-        rpc_manager = TelegramRPC(
-            token=telegram_config.get("token", ""),
-            chat_id=str(telegram_config.get("chat_id", "")),
-        )
+    tg_token = (telegram_config.get("token") or "").strip()
+    tg_chat = str(telegram_config.get("chat_id", ""))
+    if tg_token and tg_chat:
+        rpc_manager = TelegramRPC(token=tg_token, chat_id=tg_chat)
+        logger.info("Telegram RPC enabled")
+    else:
+        logger.warning("Telegram token/chat_id empty — RPC command interface disabled; trading loop still runs")
 
     # 6. Create and start worker
     worker = BotWorker(
@@ -102,16 +107,37 @@ def main() -> None:
     # (which are coroutines on that loop) can never be processed.
     import threading
 
+    # Supervisor around the worker thread: if it dies (e.g. an unexpected
+    # exception in the loop's finally block) we restart it with backoff
+    # instead of letting the whole bot exit. The Telegram RPC loop stays up.
+    _worker_thread_holder = {}
+
+    async def _run_worker_once() -> None:
+        t = threading.Thread(target=worker.start, daemon=True)
+        _worker_thread_holder["t"] = t
+        t.start()
+        while t.is_alive():
+            await asyncio.sleep(1)
+
     async def run_with_telegram():
         if rpc_manager:
             await rpc_manager.start()
         try:
-            # Run blocking worker in a daemon thread so the event loop stays free
-            worker_thread = threading.Thread(target=worker.start, daemon=True)
-            worker_thread.start()
-            # Keep the event loop alive while the worker thread runs
-            while worker_thread.is_alive():
-                await asyncio.sleep(1)
+            backoff = 5
+            while not worker._stop_forever:
+                try:
+                    await _run_worker_once()
+                    backoff = 5  # clean stop — no restart
+                    break
+                except Exception as e:
+                    logger.error(f"Worker thread crashed: {e}", exc_info=True)
+                    if rpc_manager:
+                        try:
+                            rpc_manager.send_message(f"⚠️ *Worker crashed, restarting in {backoff}s*")
+                        except Exception:
+                            pass
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 120)
         finally:
             if rpc_manager:
                 await rpc_manager.stop()

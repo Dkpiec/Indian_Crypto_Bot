@@ -72,8 +72,8 @@ internals:
   process_throttle_secs: 5
   heartbeat_interval: 60
 
-dry_run: ${DRY_RUN:-false}
-dry_run_wallet: ${DRY_RUN_WALLET:-1000.0}
+dry_run: "${DRY_RUN:-false}"
+dry_run_wallet: "${DRY_RUN_WALLET:-1000.0}"
 EOF
 echo "Config generated at $CONFIG_PATH"
 

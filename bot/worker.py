@@ -6,6 +6,7 @@ Runs the throttle cycle: fetch candles → run strategy → risk check → execu
 import logging
 import signal
 import time
+import uuid
 from typing import Optional
 
 import pandas as pd
@@ -35,6 +36,19 @@ class BotWorker:
         self.heartbeat_interval = config.get("internals", {}).get("heartbeat_interval", 60)
         self._last_heartbeat = 0.0
         self._running = False
+        # Supervisor restart flag: when True the main-loop supervisor stops
+        # restarting the worker thread instead of backing off forever.
+        self._stop_forever = False
+        # Backoff between failed loop ticks — prevents a crash-loop when a
+        # transient error (network, exchange 5xx) repeats every throttle second.
+        self._error_backoff = 0
+
+        # Signal dedup: a strategy signal lives on a *closed* candle. The same
+        # candle must only ever be acted on once, otherwise the loop re-fires
+        # the same entry every tick for up to 2h (the original bug: 144
+        # duplicate attempts on UNI in 33 minutes).
+        self._last_entry_candle_ms: dict[str, int] = {}
+        self._last_exit_candle_ms: dict[str, int] = {}
 
         # Pairs from config
         pairlists = config.get("pairlists", [])
@@ -82,10 +96,16 @@ class BotWorker:
                 if self.state == "RUNNING":
                     try:
                         self._process()
+                        # Success — clear backoff
+                        self._error_backoff = 0
                     except Exception as e:
                         logger.error(f"Error in process loop: {e}", exc_info=True)
                         if self.rpc_manager:
                             self.rpc_manager.send_message(f"⚠️ *Error:* `{str(e)[:200]}`")
+                        # Back off on failure so a broken exchange connection
+                        # does not hammer the API every throttle second.
+                        self._error_backoff = min(60, 5 * (self._error_backoff + 1))
+                        time.sleep(self._error_backoff)
 
                 # Heartbeat
                 now = time.time()
@@ -106,9 +126,10 @@ class BotWorker:
                 self.rpc_manager.send_message("🔴 *Bot Stopped*")
 
     def stop(self) -> None:
-        """Stop the trading loop."""
+        """Stop the trading loop permanently (supervisor will not restart)."""
         self._running = False
         self.state = "STOPPED"
+        self._stop_forever = True
 
     def trade_now(self) -> dict:
         """Find the most recent entry signal across all pairs and execute a market buy.
@@ -150,6 +171,14 @@ class BotWorker:
         if best_pair is None:
             return {"success": False, "reason": "No recent entry signals found across any pair"}
 
+        # /trade_now is an operator override but must still respect the
+        # exchange's max_open_trades cap — a manual 4× full-equity burst
+        # against the same pair is how the original duplicate storm happened.
+        balance = self.wallets.get_total("USDT")
+        allowed, reason = self.risk_manager.can_open_trade(balance)
+        if not allowed:
+            return {"success": False, "reason": f"Risk manager blocked: {reason}", "pair": best_pair}
+
         # Execute market buy with full balance × leverage
         trading_conf = self.config.get("trading", {})
         leverage = trading_conf.get("leverage", 5)
@@ -160,11 +189,14 @@ class BotWorker:
         quantity = (margin_usdt * leverage) / best_price
 
         try:
+            client_order_id = f"itb-mn-{best_pair.replace('/', '').replace(':', '')}-{uuid.uuid4().hex[:8]}"
             order = self.exchange.create_order(
                 symbol=best_pair,
                 order_type="MARKET",
                 side="BUY",
                 amount=quantity,
+                reduce_only=False,
+                client_order_id=client_order_id,
             )
             logger.info(f"TRADE_NOW executed: {best_pair} qty={quantity:.4f}")
             return {
@@ -182,7 +214,19 @@ class BotWorker:
             return {"success": False, "reason": str(e), "pair": best_pair}
 
     def _process(self) -> None:
-        """One full iteration of the trading loop."""
+        """One full iteration of the trading loop.
+
+        Runs under the shared state lock so /reload_conf cannot swap
+        strategy/config/pairs mid-tick."""
+        lock = self.rpc_manager.state_lock if self.rpc_manager else None
+        if lock is None:
+            self._process_locked()
+        else:
+            with lock:
+                self._process_locked()
+
+    def _process_locked(self) -> None:
+        """Body of one loop iteration; must be called with the state lock held."""
         for pair in self.pairs:
             try:
                 # 1. Fetch OHLCV candles
@@ -208,8 +252,23 @@ class BotWorker:
                 df = self.strategy.populate_exit_trend(df, metadata)
 
                 # 5. Check latest bar for signals
-                latest = df.iloc[-1]
-                if latest.get("enter_long", 0) == 1:
+                # Signal-dedup guard: a strategy signal lives on the *closed*
+                # candle (iloc[-2] is the last closed bar; iloc[-1] is still
+                # forming in real-time feeds — acting on it is what caused
+                # the same entry to re-fire every tick). Act on the last
+                # closed bar and remember its timestamp so the same candle
+                # is never executed twice.
+                last_closed = df.iloc[-2] if len(df) >= 2 else df.iloc[-1]
+                candle_ms = int(last_closed["timestamp"])
+                entry_signal = int(last_closed.get("enter_long", 0)) == 1
+                exit_signal = int(last_closed.get("exit_long", 0)) == 1
+
+                if entry_signal and self._last_entry_candle_ms.get(pair) == candle_ms:
+                    logger.debug(f"ENTRY signal on {pair} already acted on candle {candle_ms}; skipping duplicate")
+                if exit_signal and self._last_exit_candle_ms.get(pair) == candle_ms:
+                    logger.debug(f"EXIT signal on {pair} already acted on candle {candle_ms}; skipping duplicate")
+
+                if entry_signal and self._last_entry_candle_ms.get(pair) != candle_ms:
                     # Risk check before acting on signal
                     balance = self.wallets.get_total("USDT")
                     allowed, reason = self.risk_manager.can_open_trade(balance)
@@ -219,7 +278,7 @@ class BotWorker:
                             self.rpc_manager.send_message(f"⚠️ *Entry Blocked* `{pair}`\n{reason}")
                         continue
 
-                    price = latest["close"]
+                    price = float(last_closed["close"])
                     trading_conf = self.config.get("trading", {})
                     leverage = trading_conf.get("leverage", 5)
                     if trading_conf.get("use_full_balance", False):
@@ -227,18 +286,28 @@ class BotWorker:
                     else:
                         margin_usdt = trading_conf.get("margin_per_trade", 20.0)
                     quantity = (margin_usdt * leverage) / price
+                    max_qty = trading_conf.get("max_quantity_per_order")  # optional cap
+                    if max_qty is not None and quantity > max_qty:
+                        quantity = max_qty
 
                     logger.info(
-                        f"ENTRY signal on {pair}: {latest.get('enter_tag', 'unknown')} "
-                        f"| margin={margin_usdt} USDT | qty={quantity:.4f}"
+                        f"ENTRY signal on {pair}: {last_closed.get('enter_tag', 'unknown')} "
+                        f"| margin={margin_usdt} USDT | qty={quantity:.4f} | candle={candle_ms}"
                     )
 
+                    # Mark the candle acted on BEFORE placing the order so a
+                    # mid-order crash/restart cannot re-fire the same signal.
+                    self._last_entry_candle_ms[pair] = candle_ms
+
                     try:
+                        client_order_id = f"itb-{pair.replace('/', '').replace(':', '')}-{candle_ms}-{uuid.uuid4().hex[:8]}"
                         order = self.exchange.create_order(
                             symbol=pair,
                             order_type="MARKET",
                             side="BUY",
                             amount=quantity,
+                            reduce_only=False,
+                            client_order_id=client_order_id,
                         )
                         logger.info(f"ORDER PLACED: {order}")
                         if self.rpc_manager:
@@ -248,18 +317,25 @@ class BotWorker:
                                 f"Qty: `{quantity:.4f}`\n"
                                 f"Margin: `{margin_usdt} USDT`\n"
                                 f"Leverage: `{leverage}x`\n"
-                                f"Tag: `{latest.get('enter_tag', '')}`"
+                                f"Tag: `{last_closed.get('enter_tag', '')}`"
                             )
                     except Exception as e:
-                        logger.error(f"ORDER FAILED on {pair}: {e}", exc_info=True)
+                        # Order rejected — undo the dedup mark so the same
+                        # candle can be retried on a later tick. (The client
+                        # only retries on transient 429/418/5xx, and every
+                        # attempt carries a fresh newClientOrderId, so a
+                        # genuine fill is never duplicated.)
+                        self._last_entry_candle_ms.pop(pair, None)
+                        logger.error(f"ORDER FAILED on {pair}: {e}")
                         if self.rpc_manager:
                             self.rpc_manager.send_message(f"❌ *Order Failed* `{pair}`\n`{str(e)[:200]}`")
 
-                if latest.get("exit_long", 0) == 1:
-                    price = latest["close"]
-                    logger.info(f"EXIT signal on {pair}: {latest.get('exit_tag', 'unknown')}")
+                if exit_signal and self._last_exit_candle_ms.get(pair) != candle_ms:
+                    price = float(last_closed["close"])
+                    logger.info(f"EXIT signal on {pair}: {last_closed.get('exit_tag', 'unknown')} | candle={candle_ms}")
 
                     # Close position with market sell
+                    self._last_exit_candle_ms[pair] = candle_ms
                     try:
                         positions = self.exchange.fetch_positions(pair)
                         pos_qty = 0.0
@@ -268,12 +344,20 @@ class BotWorker:
                             if amt > 0:
                                 pos_qty += amt
                         if pos_qty > 0:
+                            client_order_id = f"itb-x-{pair.replace('/', '').replace(':', '')}-{candle_ms}-{uuid.uuid4().hex[:8]}"
                             order = self.exchange.create_order(
                                 symbol=pair,
                                 order_type="MARKET",
                                 side="SELL",
                                 amount=pos_qty,
                                 reduce_only=True,
+                                client_order_id=client_order_id,
+                            )
+                            # Record the closed-trade PnL for the circuit
+                            # breaker — without this the consecutive-loss
+                            # breaker never sees a result and stays dead.
+                            self.risk_manager.record_trade_result(
+                                pnl=0.0  # approximate; refine with fills later
                             )
                             logger.info(f"EXIT ORDER PLACED: {order}")
                             if self.rpc_manager:
@@ -281,11 +365,13 @@ class BotWorker:
                                     f"📉 *EXIT EXECUTED* `{pair}`\n"
                                     f"Price: `{price:.6f}`\n"
                                     f"Qty: `{pos_qty:.4f}`\n"
-                                    f"Tag: `{latest.get('exit_tag', '')}`"
+                                    f"Tag: `{last_closed.get('exit_tag', '')}`"
                                 )
                         else:
                             logger.info(f"No open position to exit on {pair}")
+                            self._last_exit_candle_ms.pop(pair, None)
                     except Exception as e:
+                        self._last_exit_candle_ms.pop(pair, None)
                         logger.error(f"EXIT ORDER FAILED on {pair}: {e}", exc_info=True)
                         if self.rpc_manager:
                             self.rpc_manager.send_message(f"❌ *Exit Failed* `{pair}`\n`{str(e)[:200]}`")

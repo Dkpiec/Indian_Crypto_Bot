@@ -35,16 +35,33 @@ class RiskManager:
         self._last_reset_date: Optional[str] = None
 
     def reset_daily_if_needed(self) -> None:
-        """Reset daily tracking at UTC midnight."""
+        """Reset daily tracking at UTC midnight.
+
+        Also resets the consecutive-loss counter: a new UTC day gives a
+        fresh allowance. Without this, 3 losses on day one would latch the
+        breaker on forever (the circuit_breaker flag clears but the counter
+        did not, so the consecutive-loss check kept rejecting every entry).
+        """
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if self._last_reset_date != today:
             self._daily_pnl = 0.0
+            self._consecutive_losses = 0
             self._circuit_breaker_active = False
             self._last_reset_date = today
             logger.info(f"Risk manager daily reset: {today}")
 
+    def reset_circuit_breaker(self) -> None:
+        """Manually clear the circuit breaker (operator override, e.g. /reset)."""
+        self._circuit_breaker_active = False
+        self._consecutive_losses = 0
+        logger.info("Circuit breaker manually reset by operator")
+
     def record_trade_result(self, pnl: float) -> None:
-        """Record a closed trade's PnL for circuit breaker tracking."""
+        """Record a closed trade's PnL for circuit breaker tracking.
+
+        MUST be called on every closed trade — without it the consecutive
+        loss counter never increments and the breaker stays dead.
+        """
         self.reset_daily_if_needed()
         self._daily_pnl += pnl
         if pnl < 0:
@@ -79,7 +96,7 @@ class RiskManager:
             return False, f"Consecutive loss limit: {self._consecutive_losses} >= {self.max_consecutive_losses}"
 
         if self._circuit_breaker_active:
-            return False, "Circuit breaker active (reset at next UTC midnight)"
+            return False, "Circuit breaker active (resets at next UTC midnight or /reset)"
 
         return True, "OK"
 

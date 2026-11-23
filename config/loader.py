@@ -121,6 +121,16 @@ def load_config(config_path: Optional[str] = None) -> dict:
     # Substitute environment variables
     config = _walk_and_substitute(config)
 
+    # Normalize dry_run: the entrypoint writes it as an unquoted YAML value
+    # (e.g. "false"/"true") and the env fallback can be either a bool or a
+    # string. int("false") used to crash startup — coerce it here instead.
+    raw_dry = config.get("dry_run")
+    if isinstance(raw_dry, str):
+        config["dry_run"] = raw_dry.strip().lower() in ("1", "true", "yes", "on")
+    elif raw_dry is None:
+        env_val = os.environ.get("DRY_RUN", "0")
+        config["dry_run"] = env_val.strip().lower() in ("1", "true", "yes", "on")
+
     # Validate required fields
     _validate_config(config)
 

@@ -26,9 +26,17 @@ class BinancePapiExchange:
         return "binance_papi"
 
     def startup(self) -> None:
-        """Sync time offset with exchange server."""
+        """Sync time offset with exchange server, then verify connectivity.
+
+        sync_server_time absorbs host clock skew — the #1 cause of 100%
+        signed-order rejection (-1021 timestamp outside recvWindow).
+        """
         if self.dry_run or self._client is None:
             return
+        try:
+            self._client.sync_server_time()
+        except Exception as e:
+            logger.warning(f"Server time sync failed (will use host clock): {e}")
         try:
             self._client.ping()
             logger.info("Papi connectivity verified")
@@ -100,7 +108,12 @@ class BinancePapiExchange:
         }
 
     def fetch_positions(self, symbol: Optional[str] = None) -> list[dict]:
-        """Fetch open positions from papi /positionRisk."""
+        """Fetch open positions from papi /positionRisk.
+
+        Raises on failure — the worker distinguishes 'no positions' from
+        'position query broken' by catching here. (Previously the silent
+        [] made /positions and exits report false negatives when auth
+        was down.)"""
         if self.dry_run or self._client is None:
             return []
         papi_symbol = self._to_papi_symbol(symbol) if symbol else None
@@ -117,8 +130,13 @@ class BinancePapiExchange:
         price: Optional[float] = None,
         time_in_force: Optional[str] = None,
         reduce_only: bool = False,
+        client_order_id: Optional[str] = None,
+        stop_price: Optional[float] = None,
     ) -> dict:
-        """Place an order on papi."""
+        """Place an order on papi.
+
+        ``client_order_id`` is forwarded as newClientOrderId so retries of
+        the same logical order are idempotent on the exchange side."""
         if self.dry_run or self._client is None:
             logger.info(f"[DRY RUN] {side} {amount} {symbol} @ {price}")
             return {"id": "dry_run", "status": "simulated"}
@@ -131,7 +149,9 @@ class BinancePapiExchange:
             quantity=amount,
             price=price,
             time_in_force=time_in_force,
+            stop_price=stop_price,
             reduce_only=reduce_only,
+            new_client_order_id=client_order_id,
         )
 
     def cancel_order(self, order_id: int, symbol: str) -> dict:

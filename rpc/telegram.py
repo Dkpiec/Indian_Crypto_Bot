@@ -5,11 +5,12 @@ No hardcoded placeholders — every response reflects actual account state.
 """
 
 import logging
+import threading
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 
 class TelegramRPC:
@@ -20,9 +21,23 @@ class TelegramRPC:
         self.chat_id = str(chat_id)
         self.bot_worker = bot_worker
         self._app = None
+        # The worker thread and the Telegram event-loop thread both read
+        # bot_worker and /reload_conf mutates worker.state and the strategy.
+        # This lock serializes state mutation against in-flight ticks so a
+        # /reload_conf cannot race a tick reading the old strategy.
+        self._state_lock = threading.RLock()
+
+    @property
+    def state_lock(self) -> threading.RLock:
+        """Shared lock around worker/strategy state. The worker's hot path
+        and the mutating Telegram handlers must both hold this."""
+        return self._state_lock
 
     async def start(self) -> None:
         """Start the Telegram polling loop (non-blocking)."""
+        if not self.token or not self.token.strip():
+            logger.warning("Telegram token is empty; RPC disabled")
+            return
         try:
             from telegram.ext import ApplicationBuilder, CommandHandler
 
@@ -65,6 +80,7 @@ class TelegramRPC:
                 "forceexit": self.cmd_forceexit,
                 "stop": self.cmd_stop,
                 "start": self.cmd_start,
+                "reset_breaker": self.cmd_reset_breaker,
                 "reload_conf": self.cmd_reload_conf,
                 "whitelist": self.cmd_whitelist,
                 "blacklist": self.cmd_blacklist,
@@ -448,12 +464,35 @@ class TelegramRPC:
         if worker and worker.state == "STOPPED":
             worker.state = "RUNNING"
             worker._running = True
+            # Reset the backoff so the resumed loop starts at full speed
+            worker._error_backoff = 0
             await update.message.reply_text("🟢 *Bot resumed*", parse_mode="Markdown")
         else:
             await update.message.reply_text("🟢 *Use /reload\\_conf to restart with current config*", parse_mode="Markdown")
 
+    async def cmd_reset_breaker(self, update, context) -> None:
+        """Manually clear the risk circuit breaker (3 consecutive losses /
+        daily loss cap) without waiting for UTC midnight."""
+        worker = self.bot_worker
+        if not worker:
+            await update.message.reply_text("❌ Bot not initialized", parse_mode="Markdown")
+            return
+        worker.risk_manager.reset_circuit_breaker()
+        status = worker.risk_manager.status
+        await update.message.reply_text(
+            f"✅ *Circuit breaker reset*\n"
+            f"daily_pnl: `{status['daily_pnl']}`\n"
+            f"consec_losses: `{status['consecutive_losses']}`\n"
+            f"breaker: `{status['circuit_breaker_active']}`",
+            parse_mode="Markdown",
+        )
+
     async def cmd_reload_conf(self, update, context) -> None:
-        """Reload config from disk and apply updated trading parameters."""
+        """Reload config from disk and apply updated trading parameters.
+
+        Swaps the worker's config/strategy references atomically under
+        ``state_lock`` so an in-flight tick cannot read half-swapped state.
+        """
         worker = self.bot_worker
         if not worker:
             await update.message.reply_text("❌ Bot not initialized", parse_mode="Markdown")
@@ -462,46 +501,53 @@ class TelegramRPC:
             from config.loader import load_config
             new_config = load_config()
 
-            trading = new_config.get("trading", {})
-            old_margin = worker.config.get("trading", {}).get("margin_per_trade", 20.0)
-            old_leverage = worker.config.get("trading", {}).get("leverage", 5)
-            new_margin = trading.get("margin_per_trade", old_margin)
-            new_leverage = trading.get("leverage", old_leverage)
-            use_full_balance = trading.get("use_full_balance", False)
+            # Swap everything under the shared lock so a concurrent tick
+            # cannot observe a partially-applied reload.
+            with self.state_lock:
+                trading = new_config.get("trading", {})
+                old_margin = worker.config.get("trading", {}).get("margin_per_trade", 20.0)
+                old_leverage = worker.config.get("trading", {}).get("leverage", 5)
+                new_margin = trading.get("margin_per_trade", old_margin)
+                new_leverage = trading.get("leverage", old_leverage)
+                use_full_balance = trading.get("use_full_balance", False)
 
-            old_pairs = list(worker.pairs)
-            new_pairlists = new_config.get("pairlists", [])
-            new_pairs = []
-            for pl in new_pairlists:
-                new_pairs.extend(pl.get("pairs", []))
-            if new_pairs:
-                worker.pairs = new_pairs
+                old_pairs = list(worker.pairs)
+                new_pairlists = new_config.get("pairlists", [])
+                new_pairs = []
+                for pl in new_pairlists:
+                    new_pairs.extend(pl.get("pairs", []))
+                if new_pairs:
+                    worker.pairs = new_pairs
 
-            strat_conf = new_config.get("strategy", {})
-            for key in ("timeframe", "max_open_trades", "stake_currency", "stoploss"):
-                if key in strat_conf:
-                    setattr(worker.strategy, key, strat_conf[key])
+                strat_conf = new_config.get("strategy", {})
+                for key in ("timeframe", "max_open_trades", "stake_currency", "stoploss"):
+                    if key in strat_conf:
+                        setattr(worker.strategy, key, strat_conf[key])
 
-            worker.config = new_config
+                worker.config = new_config
+                # Clear dedup marks on new pairs — a reloaded universe
+                # should not inherit stale dedup state.
+                worker._last_entry_candle_ms.clear()
+                worker._last_exit_candle_ms.clear()
 
-            changes = []
-            if new_margin != old_margin:
-                changes.append(f"margin: {old_margin}→{new_margin}")
-            if new_leverage != old_leverage:
-                changes.append(f"leverage: {old_leverage}→{new_leverage}")
-            if new_pairs != old_pairs:
-                changes.append(f"pairs: {len(old_pairs)}→{len(new_pairs)}")
+                changes = []
+                if new_margin != old_margin:
+                    changes.append(f"margin: {old_margin}→{new_margin}")
+                if new_leverage != old_leverage:
+                    changes.append(f"leverage: {old_leverage}→{new_leverage}")
+                if new_pairs != old_pairs:
+                    changes.append(f"pairs: {len(old_pairs)}→{len(new_pairs)}")
 
-            summary = ", ".join(changes) if changes else "no changes detected"
-            pairs_preview = ", ".join(worker.pairs[:5])
-            if len(worker.pairs) > 5:
-                pairs_preview += f" (+{len(worker.pairs)-5} more)"
+                summary = ", ".join(changes) if changes else "no changes detected"
+                pairs_preview = ", ".join(worker.pairs[:5])
+                if len(worker.pairs) > 5:
+                    pairs_preview += f" (+{len(worker.pairs)-5} more)"
 
-            if use_full_balance:
-                bal = self._get_live_balance()
-                margin_display = f"Full Balance ({bal['total']:.2f} USDT)"
-            else:
-                margin_display = f"{new_margin} USDT"
+                if use_full_balance:
+                    bal = self._get_live_balance()
+                    margin_display = f"Full Balance ({bal['total']:.2f} USDT)"
+                else:
+                    margin_display = f"{new_margin} USDT"
 
             text = (
                 f"✅ *Config Reloaded*\n"
