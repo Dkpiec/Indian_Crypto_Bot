@@ -177,6 +177,24 @@ class BinancePapiExchange:
 
     # ── Helpers ──
 
+    def get_symbol_filters(self, symbol: str) -> dict:
+        """Per-symbol LOT_SIZE / PRICE_TICK filters via the papi client.
+
+        Keys: stepSize, tickSize, minQty, maxQty. Empty dict when the
+        symbol has no known filters or the local filter file is absent.
+        """
+        if self._client is None:
+            return {}
+        papi_symbol = self._to_papi_symbol(symbol)
+        return self._client.get_symbol_filters(papi_symbol)
+
+    def get_min_quantity(self, symbol: str) -> Optional[float]:
+        """Minimum order quantity for a symbol, or None when unknown."""
+        f = self.get_symbol_filters(symbol)
+        if f.get("minQty"):
+            return float(f["minQty"])
+        return None
+
     @staticmethod
     def _to_papi_symbol(symbol: str) -> str:
         """Convert 'TRX/USDT:USDT' → 'TRXUSDT' for papi API calls."""

@@ -238,8 +238,11 @@ class BotWorker:
         trading_conf = self.config.get("trading", {})
         leverage = trading_conf.get("leverage", 5)
         if trading_conf.get("use_full_balance", False):
+            # Size from FREE equity, not total. Total reports free + used
+            # margin; a manual burst at total/slot cannot be filled while the
+            # slots already hold margin (-2019 storm, /trade_now variant).
             slots = max(1, self.max_open_trades)
-            margin_usdt = self.wallets.get_total("USDT") / slots
+            margin_usdt = self.wallets.get_free("USDT") / slots
         else:
             margin_usdt = trading_conf.get("margin_per_trade", 20.0)
 
@@ -355,13 +358,19 @@ class BotWorker:
                     trading_conf = self.config.get("trading", {})
                     leverage = trading_conf.get("leverage", 5)
                     use_full_balance = trading_conf.get("use_full_balance", False)
-                    equity = self.wallets.get_total("USDT")
                     if use_full_balance:
-                        # Split the whole equity across max_open_trades equal
-                        # slots instead of concentrating it into every signal —
-                        # that was the -2019 margin-insufficient storm.
+                        # Split the equity across max_open_trades equal slots
+                        # instead of concentrating it into every signal — that
+                        # was the -2019 margin-insufficient storm.
                         slots = max(1, self.max_open_trades)
-                        margin_usdt = equity / slots
+                        # Size from FREE equity only. get_total() reports
+                        # account equity (free + used margin). Sizing from
+                        # total while other slots hold margin makes Binance
+                        # reject every entry with -2019 "Margin is
+                        # insufficient" — the account cannot cover 4 full
+                        # slots of equity at once. Free is the margin
+                        # actually available to allocate to a new position.
+                        margin_usdt = self.wallets.get_free("USDT") / slots
                     else:
                         margin_usdt = trading_conf.get("margin_per_trade", 20.0)
 
@@ -380,6 +389,19 @@ class BotWorker:
                     max_qty = trading_conf.get("max_quantity_per_order")  # optional cap
                     if max_qty is not None and quantity > max_qty:
                         quantity = max_qty
+
+                    # Floor guard: if the computed order is below the
+                    # symbol's minimum quantity, log and skip instead of
+                    # firing a guaranteed rejection. Free-margin sizing
+                    # makes this likely on a small account (TRXUSDT
+                    # minQty=1 → 1 USDT notional at price 0.0224).
+                    min_qty = self.exchange.get_min_quantity(pair)
+                    if min_qty and quantity < min_qty:
+                        logger.info(
+                            f"ENTRY on {pair} skipped: quantity {quantity:.4f} "
+                            f"< minQty {min_qty} (free={self.wallets.get_free('USDT'):.2f})."
+                        )
+                        continue
 
                     logger.info(
                         f"ENTRY signal on {pair}: {last_closed.get('enter_tag', 'unknown')} "
