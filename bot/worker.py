@@ -16,6 +16,21 @@ from utils.risk_manager import RiskManager
 logger = logging.getLogger(__name__)
 
 
+def _client_order_id(prefix: str, symbol: str) -> str:
+    """Build a Binance-valid newClientOrderId: 1-36 chars, alnum only.
+
+    Binance rejects -4015 if the id exceeds 36 characters. The old format
+    embedded a 13-digit millisecond candle timestamp, pushing long symbols
+    (e.g. PENDLEUSDT) over the limit. This keeps a short, human-readable
+    prefix + a truncated symbol tag + 8 hex of uuid4 — well under 36, still
+    effectively collision-free for idempotent retries.
+    """
+    tag = symbol.replace("/", "").replace(":", "").replace(" ", "")[:8]
+    uid = uuid.uuid4().hex[:10]
+    oid = f"{prefix}{tag}{uid}"
+    return oid[:36]
+
+
 class BotWorker:
     """Core trading loop with state machine and heartbeat."""
 
@@ -189,7 +204,7 @@ class BotWorker:
         quantity = (margin_usdt * leverage) / best_price
 
         try:
-            client_order_id = f"itb-mn-{best_pair.replace('/', '').replace(':', '')}-{uuid.uuid4().hex[:8]}"
+            client_order_id = _client_order_id("m", best_pair)
             order = self.exchange.create_order(
                 symbol=best_pair,
                 order_type="MARKET",
@@ -300,7 +315,7 @@ class BotWorker:
                     self._last_entry_candle_ms[pair] = candle_ms
 
                     try:
-                        client_order_id = f"itb-{pair.replace('/', '').replace(':', '')}-{candle_ms}-{uuid.uuid4().hex[:8]}"
+                        client_order_id = _client_order_id("e", pair)
                         order = self.exchange.create_order(
                             symbol=pair,
                             order_type="MARKET",
@@ -344,7 +359,7 @@ class BotWorker:
                             if amt > 0:
                                 pos_qty += amt
                         if pos_qty > 0:
-                            client_order_id = f"itb-x-{pair.replace('/', '').replace(':', '')}-{candle_ms}-{uuid.uuid4().hex[:8]}"
+                            client_order_id = _client_order_id("x", pair)
                             order = self.exchange.create_order(
                                 symbol=pair,
                                 order_type="MARKET",
