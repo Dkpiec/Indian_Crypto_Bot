@@ -94,8 +94,37 @@ class TelegramRPC:
 
             await self._app.initialize()
             await self._app.start()
+
+            # Guard against the "terminated by other getUpdates request"
+            # Conflict: it means ANOTHER instance of this bot (an orphaned
+            # Coolify container from a previous deploy that was never killed)
+            # is polling the same token. Without handling it, python-
+            # telegram-bot's network loop re-raises and logs an unbounded
+            # ERROR traceback. Instead, back off quietly and let the newest
+            # instance win the token.
+            self._poll_backoff_until = 0.0
+
+            def _polling_error_callback(err) -> None:
+                text = str(err)
+                if "Conflict" in text or "terminated by other getUpdates" in text:
+                    import time as _t
+                    now = _t.time()
+                    if now >= self._poll_backoff_until:
+                        logger.warning(
+                            "Telegram Conflict: another bot instance holds this "
+                            "token (likely an orphaned container from a previous "
+                            "deploy). This instance is backing off for 5 min; "
+                            "ensure only one container runs the bot."
+                        )
+                        self._poll_backoff_until = now + 300
+                    return
+                logger.error(f"Telegram polling error: {err}")
+
             if self._app.updater is not None:
-                await self._app.updater.start_polling(drop_pending_updates=True)
+                await self._app.updater.start_polling(
+                    drop_pending_updates=True,
+                    error_callback=_polling_error_callback,
+                )
             logger.info("Telegram RPC started, polling for commands")
 
         except ImportError:
