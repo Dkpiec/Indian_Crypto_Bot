@@ -64,6 +64,12 @@ class BotWorker:
         # duplicate attempts on UNI in 33 minutes).
         self._last_entry_candle_ms: dict[str, int] = {}
         self._last_exit_candle_ms: dict[str, int] = {}
+        # Per-pair cooldowns after a failed order: a failing pair stops
+        # alerting + re-ordering for this many seconds instead of hammering
+        # the exchange and Telegram every throttle tick.
+        self._entry_cooldown_until: dict[str, float] = {}
+        self._exit_cooldown_until: dict[str, float] = {}
+        self._order_cooldown_secs = 300.0
 
         # Pairs from config
         pairlists = config.get("pairlists", [])
@@ -327,6 +333,14 @@ class BotWorker:
                 if exit_signal and self._last_exit_candle_ms.get(pair) == candle_ms:
                     logger.debug(f"EXIT signal on {pair} already acted on candle {candle_ms}; skipping duplicate")
 
+                # Per-pair cooldown: a pair whose last order failed stays quiet
+                # for _order_cooldown_secs so it does not alert + re-order on
+                # every throttle tick. A NEW closed candle still re-triggers.
+                if time.time() < self._entry_cooldown_until.get(pair, 0):
+                    if entry_signal:
+                        logger.debug(f"ENTRY on {pair} in post-failure cooldown; skipping")
+                    entry_signal = False
+
                 if entry_signal and self._last_entry_candle_ms.get(pair) != candle_ms:
                     # Risk check before acting on signal
                     balance = self.wallets.get_total("USDT")
@@ -374,6 +388,16 @@ class BotWorker:
 
                     # Mark the candle acted on BEFORE placing the order so a
                     # mid-order crash/restart cannot re-fire the same signal.
+                    #
+                    # IMPORTANT: this mark is KEPT on failure. The previous
+                    # behaviour popped it so a rejected order could be retried
+                    # on a later tick — but a *deterministic* rejection
+                    # (-2019 margin, -1111 precision, -4015 bad id) never
+                    # fixes itself within the same closed candle, so re-firing
+                    # it every throttle cycle produced the "Order Failed ...
+                    # every second" Telegram alert storm. A candle, once acted
+                    # on, is only retried on the NEXT close (or by an explicit
+                    # /trade_now operator override).
                     self._last_entry_candle_ms[pair] = candle_ms
 
                     try:
@@ -397,15 +421,21 @@ class BotWorker:
                                 f"Tag: `{last_closed.get('enter_tag', '')}`"
                             )
                     except Exception as e:
-                        # Order rejected — undo the dedup mark so the same
-                        # candle can be retried on a later tick. (The client
-                        # only retries on transient 429/418/5xx, and every
-                        # attempt carries a fresh newClientOrderId, so a
-                        # genuine fill is never duplicated.)
-                        self._last_entry_candle_ms.pop(pair, None)
-                        logger.error(f"ORDER FAILED on {pair}: {e}")
+                        # Keep the dedup mark (see above) so the same candle is
+                        # not re-fired. Add a per-pair cooldown so a failing
+                        # pair stops alerting for a few minutes instead of
+                        # hammering the exchange + Telegram every tick.
+                        self._entry_cooldown_until[pair] = time.time() + 300
+                        logger.error(
+                            f"ORDER FAILED on {pair}: {e} "
+                            f"(dedup kept; retrying only on next candle close)"
+                        )
                         if self.rpc_manager:
                             self.rpc_manager.send_message(f"❌ *Order Failed* `{pair}`\n`{str(e)[:200]}`")
+
+                if exit_signal and time.time() < self._exit_cooldown_until.get(pair, 0):
+                    logger.debug(f"EXIT on {pair} in post-failure cooldown; skipping")
+                    exit_signal = False
 
                 if exit_signal and self._last_exit_candle_ms.get(pair) != candle_ms:
                     price = float(last_closed["close"])
@@ -448,8 +478,11 @@ class BotWorker:
                             logger.info(f"No open position to exit on {pair}")
                             self._last_exit_candle_ms.pop(pair, None)
                     except Exception as e:
-                        self._last_exit_candle_ms.pop(pair, None)
-                        logger.error(f"EXIT ORDER FAILED on {pair}: {e}", exc_info=True)
+                        # Keep the dedup mark on a failed exit too: re-firing a
+                        # reduce-only sell on the same candle is pure spam and
+                        # risks double-close. Retry only on the next close.
+                        self._exit_cooldown_until[pair] = time.time() + 300
+                        logger.error(f"EXIT ORDER FAILED on {pair}: {e} (dedup kept; retrying on next candle close)", exc_info=True)
                         if self.rpc_manager:
                             self.rpc_manager.send_message(f"❌ *Exit Failed* `{pair}`\n`{str(e)[:200]}`")
 
