@@ -9,6 +9,7 @@ Public market data does NOT exist on papi and must stay on fapi.
 
 import hashlib
 import hmac
+import json
 import logging
 import time
 from typing import Any, Optional
@@ -104,6 +105,73 @@ class PapiClient:
         # time_offset_ms is kept (not offset_ms) for compatibility with callers.
         self.time_offset_ms = 0
         self._server_time_warned = False
+        # Cache of exchange_info filters per symbol, populated lazily so that
+        # quantity/price can be rounded to the LOT_SIZE / PRICE_TICK step.
+        # Without this, a raw float like 0.5364058424702716 is rejected with
+        # -1111 "Precision is over the maximum defined for this asset".
+        self._filters_cache: dict = {}
+        self._filters_loaded = False
+
+    # ── Exchange-info / lot-size helpers ──
+
+    def _load_exchange_info_filters(self) -> dict:
+        """Load per-symbol LOT_SIZE / PRICE_TICK filters from a LOCAL data file.
+
+        The papi gateway exposes no public market-data endpoints (/exchangeInfo,
+        /klines, /ticker all 404 there), and this application must use papi
+        only — no fapi. So the filters ship as a static file
+        (data/papi_filters.json), captured once and refreshed by a manual
+        step, not a live network call. Missing/unknown symbols yield no
+        rounding (safe: the exchange rejects a bad-precision order, same as
+        before) so order placement is never blocked.
+        """
+        import os
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "data", "papi_filters.json")
+        index: dict = {}
+        try:
+            with open(path, "r") as fh:
+                index = json.load(fh)
+            if not isinstance(index, dict):
+                index = {}
+            self._filters_loaded = True
+        except FileNotFoundError:
+            logger.warning(f"No local papi filters file at {path}; skipping precision rounding.")
+        except Exception as e:
+            logger.warning(f"Failed to load papi filters from {path}: {e}")
+        return index
+
+    def get_symbol_filters(self, papi_symbol: str) -> dict:
+        """Return {stepSize, tickSize, minQty, maxQty} for a papi symbol.
+
+        Lazily loads the LOCAL filter file once, then looks up the exact
+        symbol. Returns {} (no rounding) when the symbol has no known
+        filters or the load failed — order placement is never blocked.
+        """
+        if papi_symbol in self._filters_cache:
+            return self._filters_cache[papi_symbol]
+        if not self._filters_loaded:
+            self._filters_cache = self._load_exchange_info_filters()
+        return self._filters_cache.get(papi_symbol, {})
+
+    @staticmethod
+    def round_step(value: float, step: str) -> float:
+        """Round *value* down to the nearest multiple of *step*.
+
+        Uses decimal arithmetic so stepSize values like '0.00010000' (8
+        decimals) are handled exactly — float math would round-trip and
+        leave spurious digits. Returns value unchanged if step is empty.
+        """
+        if value is None or not step:
+            return value
+        try:
+            from decimal import Decimal, ROUND_DOWN
+            d = Decimal(str(value))
+            s = Decimal(str(step))
+            return float((d / s).quantize(Decimal("1"), rounding=ROUND_DOWN) * s)
+        except Exception:
+            return value
+
 
     # ── Time sync (clock skew protection) ──
 
@@ -344,7 +412,27 @@ class PapiClient:
         """POST /order (papi, signed) — place a new order.
         Binance Portfolio Margin API requires positionSide=BOTH for
         accounts with hedge mode disabled (the default for most papi accounts).
-        Always pass new_client_order_id so retries are idempotent."""
+        Always pass new_client_order_id so retries are idempotent.
+        Quantity/price are rounded to the symbol's LOT_SIZE stepSize and
+        PRICE_TICK tickSize (fetched + cached from /exchangeInfo) so the
+        order is not rejected with -1111 precision errors.
+        """
+        # Round quantity/price to exchange filters before posting.
+        try:
+            filters = self.get_symbol_filters(symbol)
+            if filters.get("stepSize"):
+                quantity = self.round_step(quantity, filters["stepSize"])
+            if price is not None and filters.get("tickSize"):
+                price = self.round_step(price, filters["tickSize"])
+            if filters.get("minQty"):
+                min_qty = float(filters["minQty"])
+                if quantity < min_qty:
+                    logger.warning(
+                        f"Rounded quantity {quantity} below minQty {min_qty} for {symbol}; "
+                        "order will be rejected by the exchange (skip: signal too small)."
+                    )
+        except Exception as e:
+            logger.warning(f"filter lookup failed for {symbol}, sending raw quantity: {e}")
         params = {
             "symbol": symbol,
             "side": side.upper(),
