@@ -117,13 +117,22 @@ class TestEntryPriceGate(unittest.TestCase):
         self.assertEqual(result["mode"], "SKIP")
         self.assertAlmostEqual(result["deviation"], 2.0, places=2)
 
-    def test_fallback_to_market_when_live_price_unavailable(self):
-        """live_price=0 → MARKET fallback, deviation=0."""
+    def test_fallback_to_skip_when_live_price_unavailable(self):
+        """live_price=0 / ticker failure → SKIP (never blind MARKET)."""
         w, ex = _make_worker()
         ex._last = 0.0
         result = w._resolve_entry_mode("TRX/USDT:USDT", signal_price=0.0224)
-        self.assertEqual(result["mode"], "MARKET")
+        self.assertEqual(result["mode"], "SKIP")
         self.assertAlmostEqual(result["deviation"], 0.0, places=6)
+
+    def test_fallback_to_skip_when_ticker_raises(self):
+        """ticker raises → SKIP (fail toward waiting, not market-buying)."""
+        w, ex = _make_worker()
+        def _raise(pair):
+            raise RuntimeError("ticker rate-limited")
+        ex.fetch_ticker = _raise
+        result = w._resolve_entry_mode("TRX/USDT:USDT", signal_price=0.0224)
+        self.assertEqual(result["mode"], "SKIP")
 
     def test_defaults_apply_when_keys_absent(self):
         """Without the new trading keys, defaults kick in."""
