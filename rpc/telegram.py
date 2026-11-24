@@ -118,40 +118,46 @@ class TelegramRPC:
             # token cleanly.
             self._consecutive_conflicts = 0
 
+            # Create the yield event BEFORE start_polling so the error
+            # callback can safely set it on the very first 409 without a
+            # race (the previous code assigned it after start_polling).
+            import asyncio as _asyncio
+            self._conflict_yield_event = _asyncio.Event()
+
             def _polling_error_callback(err) -> None:
+                # PTB raises telegram.error.Conflict on a 409. Detect by
+                # type name when available (robust across PTB builds where
+                # the message text varies), else fall back to text.
                 text = str(err)
-                if "Conflict" in text or "terminated by other getUpdates" in text:
+                is_conflict = (
+                    "Conflict" in type(err).__name__
+                    or "Conflict" in text
+                    or "terminated by other getUpdates" in text
+                )
+                if is_conflict:
                     self._consecutive_conflicts += 1
                     logger.warning(
                         "Telegram Conflict: another bot instance holds this "
                         "token (likely an orphaned container from a previous "
-                        "deploy). This instance is yielding the token (stopping "
-                        "its own polling) so the newest instance wins cleanly."
+                        "deploy). This instance is yielding the token "
+                        "(stopping its own polling) so the newest instance "
+                        "wins cleanly."
                     )
-                    # Yield: stop this instance's polling. The trading loop is
-                    # independent of Telegram, so the bot keeps trading; only
-                    # the command interface on THIS (losing) instance is
-                    # disabled. The newer instance owns the token and serves
-                    # commands.
-                    if self._app is not None and self._conflict_yield_event is not None:
-                        try:
+                    # Yield: stop this instance's polling. The trading loop
+                    # is independent of Telegram, so the bot keeps trading;
+                    # only the command interface on THIS (losing) instance
+                    # is disabled. The newer instance owns the token and
+                    # serves commands.
+                    try:
+                        if self._conflict_yield_event is not None:
                             self._conflict_yield_event.set()
-                        except Exception:
-                            pass
+                    except Exception:
+                        pass
                     return
-                # A non-409 error means we were able to reach Telegram — reset
-                # the consecutive conflict counter.
+                # A non-409 error means we were able to reach Telegram —
+                # reset the consecutive conflict counter.
                 self._consecutive_conflicts = 0
                 logger.error(f"Telegram polling error: {err}")
-
-            # Conflict-yield: if this instance keeps losing the token race to
-            # a newer container, it stops its own polling so the winner holds
-            # the token cleanly. The event is created here (needs the running
-            # loop). A watchdog coroutine awaits it and, when set, stops the
-            # updater so the losing (older) container no longer hammers
-            # getUpdates — the direct cause of the 409 on the new container.
-            import asyncio as _asyncio
-            self._conflict_yield_event = _asyncio.Event()
 
             if self._app.updater is not None:
                 await self._app.updater.start_polling(
