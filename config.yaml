@@ -57,6 +57,16 @@ trading:
   margin_per_trade: 20.0
   leverage: 5
   use_full_balance: true
+  # Entry price gate + limit-order behavior. On a closed-candle signal the live
+  # price has usually moved; instead of a blind MARKET fill we compare the
+  # live last price to the signal close:
+  #   dev <= entry_min_deviation_pct -> MARKET (already at the signal price)
+  #   min < dev <= entry_max_deviation_pct -> LIMIT at the signal price (GTX)
+  #   dev  > entry_max_deviation_pct -> SKIP the entry (price moved too far)
+  # A resting signal limit auto-cancels after entry_limit_expires_secs.
+  entry_max_deviation_pct: 1.0
+  entry_min_deviation_pct: 0.25
+  entry_limit_expires_secs: 1800
 
 internals:
   process_throttle_secs: 5

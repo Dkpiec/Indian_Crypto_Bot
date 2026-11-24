@@ -1,0 +1,162 @@
+"""Entry price-gate + market/limit selection tests.
+
+Regression coverage for the "check live price before taking a signal"
+change: when the live last price has moved away from the signal close
+more than entry_max_deviation_pct the entry is SKIPPED; when it is
+close but not at the signal a LIMIT order is placed; when it is at
+the signal a MARKET order is placed.
+"""
+import os
+import sys
+import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from exchange.binance_papi import BinancePapiExchange
+from bot.worker import BotWorker
+
+
+class _Wallet:
+    def get_free(self, ccy):
+        return 200.0
+
+    def get_used(self, ccy):
+        return 0.0
+
+    def get_total(self, ccy):
+        return 200.0
+
+    def update(self):
+        pass
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+
+class _Strategy:
+    name = "ATR_CHANNEL_2H"
+    timeframe = "2h"
+    last_candle_ts = None
+    last_candle_open_time = None
+
+
+def _make_worker(max_open=4, free=200.0, used=0.0, leverage=5, trading=None):
+    cfg = {
+        "strategy": {"name": "ATR_CHANNEL_2H", "timeframe": "2h"},
+        "trading": {
+            "leverage": leverage,
+            "use_full_balance": True,
+            "entry_max_deviation_pct": 1.0,
+            "entry_min_deviation_pct": 0.25,
+            "entry_limit_expires_secs": 1800,
+            **(trading or {}),
+        },
+        "pairlists": [{"method": "StaticPairList", "pairs": ["TRX/USDT:USDT"]}],
+        "internals": {"process_throttle_secs": 1},
+    }
+    wallets = _Wallet()
+
+    class _Exchange:
+        def __init__(self, last_price):
+            self._last = last_price
+            self.calls = []
+
+        def fetch_ticker(self, pair):
+            self.calls.append(pair)
+            return {"last": self._last}
+
+        def fetch_ohlcv(self, *a, **k):
+            return []
+
+        def fetch_positions(self, *a, **k):
+            return []
+
+        def create_order(self, *a, **k):
+            return {"id": 1}
+
+        def get_min_quantity(self, pair):
+            return 1.0
+
+    ex = _Exchange(200.0)
+    w = BotWorker(cfg, ex, _Strategy(), wallets, rpc_manager=None)
+    return w, ex
+
+
+class TestEntryPriceGate(unittest.TestCase):
+    def test_market_when_live_price_at_signal(self):
+        """dev=0% → MARKET mode, no limit order expected."""
+        w, ex = _make_worker()
+        # Live price exactly equals the signal price.
+        ex._last = 0.0224
+        result = w._resolve_entry_mode("TRX/USDT:USDT", signal_price=0.0224)
+        self.assertEqual(result["mode"], "MARKET")
+        self.assertAlmostEqual(result["deviation"], 0.0, places=6)
+
+    def test_limit_when_live_price_within_max_deviation(self):
+        """dev=0.5% (0.25 < 0.5 <= 1.0) → LIMIT mode."""
+        w, ex = _make_worker()
+        # live price 0.5% above signal
+        signal_price = 0.0224
+        live_price = signal_price * 1.005
+        ex._last = live_price
+        result = w._resolve_entry_mode("TRX/USDT:USDT", signal_price)
+        self.assertEqual(result["mode"], "LIMIT")
+        self.assertAlmostEqual(result["deviation"], 0.5, places=2)
+        self.assertAlmostEqual(result["live_price"], live_price, places=6)
+
+    def test_skip_when_live_price_beyond_max_deviation(self):
+        """dev=2% (> 1.0 max) → SKIP mode."""
+        w, ex = _make_worker()
+        signal_price = 0.0224
+        live_price = signal_price * 1.02
+        ex._last = live_price
+        result = w._resolve_entry_mode("TRX/USDT:USDT", signal_price)
+        self.assertEqual(result["mode"], "SKIP")
+        self.assertAlmostEqual(result["deviation"], 2.0, places=2)
+
+    def test_fallback_to_market_when_live_price_unavailable(self):
+        """live_price=0 → MARKET fallback, deviation=0."""
+        w, ex = _make_worker()
+        ex._last = 0.0
+        result = w._resolve_entry_mode("TRX/USDT:USDT", signal_price=0.0224)
+        self.assertEqual(result["mode"], "MARKET")
+        self.assertAlmostEqual(result["deviation"], 0.0, places=6)
+
+    def test_defaults_apply_when_keys_absent(self):
+        """Without the new trading keys, defaults kick in."""
+        cfg = {
+            "strategy": {"name": "ATR_CHANNEL_2H", "timeframe": "2h"},
+            "trading": {"leverage": 5, "use_full_balance": True},
+            "pairlists": [{"method": "StaticPairList", "pairs": ["TRX/USDT:USDT"]}],
+            "internals": {"process_throttle_secs": 1},
+        }
+
+        class _Ex:
+            def fetch_ticker(self, pair):
+                return {"last": 1.0}
+
+            def fetch_ohlcv(self, *a, **k):
+                return []
+
+            def fetch_positions(self, *a, **k):
+                return []
+
+            def create_order(self, *a, **k):
+                return {"id": 1}
+
+            def get_min_quantity(self, pair):
+                return 1.0
+
+        ex = _Ex()
+        w = BotWorker(cfg, ex, _Strategy(), _Wallet(), rpc_manager=None)
+        self.assertAlmostEqual(w.entry_max_deviation_pct, 1.0, places=6)
+        self.assertAlmostEqual(w.entry_min_deviation_pct, 0.25, places=6)
+        self.assertEqual(w.entry_limit_expires_secs, 1800)
+        self.assertEqual(w._open_signal_limit_ms, {})
+
+
+if __name__ == "__main__":
+    unittest.main()

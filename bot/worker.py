@@ -91,6 +91,29 @@ class BotWorker:
                              strategy_conf.get("max_open_trades", 4))
         )
 
+        # Entry price-gate + limit-order knobs. On a closed-candle entry
+        # signal the market has usually moved; instead of a blind MARKET
+        # fill we compare the live last price to the signal close:
+        #   dev <= entry_min_deviation_pct  -> MARKET (already at the price)
+        #   min < dev <= entry_max_deviation_pct -> LIMIT at the signal price
+        #   dev  > entry_max_deviation_pct  -> SKIP the entry entirely
+        # A resting GTX limit auto-cancels after entry_limit_expires_secs
+        # and the next tick re-evaluates. Defaults apply if the keys are
+        # absent.
+        self.entry_max_deviation_pct = float(
+            trading_conf.get("entry_max_deviation_pct", 1.0)
+        )
+        self.entry_min_deviation_pct = float(
+            trading_conf.get("entry_min_deviation_pct", 0.25)
+        )
+        self.entry_limit_expires_secs = int(
+            trading_conf.get("entry_limit_expires_secs", 1800)
+        )
+        # Track signal limit orders so we can stop re-firing a still-resting
+        # (unfilled) limit on the same candle — dedupe on the candle it was
+        # placed for.
+        self._open_signal_limit_ms: dict[str, int] = {}
+
         # Signal handlers for graceful shutdown
         signal.signal(signal.SIGTERM, self._handle_signal)
         signal.signal(signal.SIGINT, self._handle_signal)
@@ -121,6 +144,56 @@ class BotWorker:
         except Exception as e:
             logger.warning(f"Could not read open positions ({e}); failing closed.")
             return 10**6
+
+    # ------------------------------------------------------------------
+    # Entry execution: live-price gate + market/limit selection
+    # ------------------------------------------------------------------
+    def _resolve_entry_mode(self, pair: str, signal_price: float) -> dict:
+        """Pick how to enter at the signal price, using the live last price.
+
+        Returns a dict:
+          live_price : float  — latest last price (0.0 if unavailable)
+          deviation  : float  — |live - signal| / signal, in percent
+          mode       : str    — "MARKET" | "LIMIT" | "SKIP"
+
+        Decision (defaults from the trading config, see __init__):
+          dev <= entry_min_deviation_pct    -> MARKET (price at the signal)
+          min < dev <= entry_max_deviation  -> LIMIT at the signal price
+          dev  > entry_max_deviation        -> SKIP (price moved too far)
+        If the live price can't be read we fall back to MARKET so the bot
+        still trades, and log a warning.
+        """
+        try:
+            ticker = self.exchange.fetch_ticker(pair)
+            live_price = float(ticker.get("last", 0.0))
+        except Exception as e:
+            logger.warning(
+                f"Could not read live price for {pair}, falling back to "
+                f"MARKET: {e}"
+            )
+            live_price = 0.0
+
+        if live_price <= 0.0:
+            return {
+                "live_price": 0.0,
+                "deviation": 0.0,
+                "mode": "MARKET",
+            }
+
+        deviation = (abs(live_price - signal_price) / signal_price) * 100.0
+
+        if deviation <= self.entry_min_deviation_pct:
+            mode = "MARKET"
+        elif deviation <= self.entry_max_deviation_pct:
+            mode = "LIMIT"
+        else:
+            mode = "SKIP"
+
+        return {
+            "live_price": live_price,
+            "deviation": deviation,
+            "mode": mode,
+        }
 
     def start(self) -> None:
         """Start the trading loop."""
@@ -408,44 +481,111 @@ class BotWorker:
                         f"| margin={margin_usdt} USDT | qty={quantity:.4f} | candle={candle_ms}"
                     )
 
+                    # Price gate + market/limit selection. The entry signal is
+                    # on a *closed* candle, but by the time we act on it the
+                    # live last price has usually moved. Instead of a blind
+                    # MARKET fill we compare the live price to the signal
+                    # close: MARKET when already at the signal, a GTX limit
+                    # at the signal price when it's near, and SKIP when the
+                    # price has moved more than entry_max_deviation_pct.
+                    entry = self._resolve_entry_mode(pair, price)
+                    entry_mode = entry["mode"]
+                    dev_pct = entry["deviation"]
+                    live_price = entry["live_price"]
+
+                    if entry_mode == "SKIP":
+                        logger.info(
+                            f"ENTRY on {pair} SKIPPED: live {live_price:.6f} is "
+                            f"{dev_pct:.3f}% from signal {price:.6f} (> "
+                            f"{self.entry_max_deviation_pct}% max); price moved."
+                        )
+                        if self.rpc_manager:
+                            self.rpc_manager.send_message(
+                                f"⚠️ *Entry skipped* `{pair}`\n"
+                                f"Live `{live_price:.6f}` is `{dev_pct:.3f}%` from "
+                                f"signal `{price:.6f}` "
+                                f"(> {self.entry_max_deviation_pct}% max deviation); "
+                                f"price moved — no fill."
+                            )
+                        # Marked acted-on (dedup mark kept) so the same candle
+                        # is not re-tried; the signal re-fires on the next
+                        # close if price has re-converged.
+                        continue
+
+                    # A still-resting, unfilled signal limit on this same
+                    # candle must not be re-fired — it's already on the book
+                    # and will auto-cancel at its GTX expiry, after which the
+                    # live price is re-checked on the next tick.
+                    if (
+                        entry_mode == "LIMIT"
+                        and self._open_signal_limit_ms.get(pair) == candle_ms
+                    ):
+                        logger.debug(
+                            f"ENTRY on {pair}: signal limit still resting for "
+                            f"candle {candle_ms}; holding."
+                        )
+                        continue
+
                     # Mark the candle acted on BEFORE placing the order so a
                     # mid-order crash/restart cannot re-fire the same signal.
-                    #
-                    # IMPORTANT: this mark is KEPT on failure. The previous
-                    # behaviour popped it so a rejected order could be retried
-                    # on a later tick — but a *deterministic* rejection
-                    # (-2019 margin, -1111 precision, -4015 bad id) never
-                    # fixes itself within the same closed candle, so re-firing
-                    # it every throttle cycle produced the "Order Failed ...
-                    # every second" Telegram alert storm. A candle, once acted
-                    # on, is only retried on the NEXT close (or by an explicit
-                    # /trade_now operator override).
                     self._last_entry_candle_ms[pair] = candle_ms
 
                     try:
-                        client_order_id = _client_order_id("e", pair)
-                        order = self.exchange.create_order(
-                            symbol=pair,
-                            order_type="MARKET",
-                            side="BUY",
-                            amount=quantity,
-                            reduce_only=False,
-                            client_order_id=client_order_id,
-                        )
-                        logger.info(f"ORDER PLACED: {order}")
+                        if entry_mode == "MARKET":
+                            client_order_id = _client_order_id("e", pair)
+                            order = self.exchange.create_order(
+                                symbol=pair,
+                                order_type="MARKET",
+                                side="BUY",
+                                amount=quantity,
+                                reduce_only=False,
+                                client_order_id=client_order_id,
+                            )
+                            logger.info(
+                                f"ENTRY (MARKET) on {pair}: {price:.6f} "
+                                f"qty={quantity:.4f} dev={dev_pct:.3f}% {order}"
+                            )
+                        else:  # LIMIT at the signal price, GTX with a short TTL
+                            client_order_id = _client_order_id("l", pair)
+                            order = self.exchange.create_order(
+                                symbol=pair,
+                                order_type="LIMIT",
+                                side="BUY",
+                                amount=quantity,
+                                price=price,
+                                time_in_force="GTX",
+                                reduce_only=False,
+                                client_order_id=client_order_id,
+                            )
+                            # Track the candle this limit was placed for so we
+                            # don't keep re-firing a still-resting, unfilled
+                            # order; after it fills or its GTX expiry cancels
+                            # it, the live price is re-checked on the next tick.
+                            self._open_signal_limit_ms[pair] = candle_ms
+                            logger.info(
+                                f"ENTRY (LIMIT) on {pair} @ {price:.6f} "
+                                f"qty={quantity:.4f} dev={dev_pct:.3f}% "
+                                f"GTX ttl={self.entry_limit_expires_secs}s {order}"
+                            )
+
                         if self.rpc_manager:
                             self.rpc_manager.send_message(
                                 f"📈 *ENTRY EXECUTED* `{pair}`\n"
                                 f"Price: `{price:.6f}`\n"
                                 f"Qty: `{quantity:.4f}`\n"
+                                f"Type: `{entry_mode}` (dev {dev_pct:.3f}%)\n"
                                 f"Margin: `{margin_usdt} USDT`\n"
                                 f"Leverage: `{leverage}x`\n"
                                 f"Tag: `{last_closed.get('enter_tag', '')}`"
                             )
                     except Exception as e:
-                        # Keep the dedup mark (see above) so the same candle is
-                        # not re-fired. Add a per-pair cooldown so a failing
-                        # pair stops alerting for a few minutes instead of
+                        # A resting LIMIT that failed to place is not yet on
+                        # the book — clear it so the next tick can retry.
+                        if entry_mode == "LIMIT":
+                            self._open_signal_limit_ms.pop(pair, None)
+                        # Keep the dedup mark so the same candle is not
+                        # re-fired. Add a per-pair cooldown so a failing pair
+                        # stops alerting for a few minutes instead of
                         # hammering the exchange + Telegram every tick.
                         self._entry_cooldown_until[pair] = time.time() + 300
                         logger.error(
