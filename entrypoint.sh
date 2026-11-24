@@ -67,6 +67,9 @@ trading:
   margin_per_trade: 20.0
   leverage: 5
   use_full_balance: true
+  entry_max_deviation_pct: ${ENTRY_MAX_DEVIATION_PCT:-1.0}
+  entry_min_deviation_pct: ${ENTRY_MIN_DEVIATION_PCT:-0.25}
+  entry_limit_expires_secs: ${ENTRY_LIMIT_EXPIRES_SECS:-1800}
 
 internals:
   process_throttle_secs: 5
