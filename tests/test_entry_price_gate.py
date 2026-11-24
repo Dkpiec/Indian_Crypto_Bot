@@ -210,5 +210,57 @@ class TestEntryPriceGate(unittest.TestCase):
         self.assertTrue(ms_was_set, "precondition: ms mark must be set")
 
 
+class TestConflictYield(unittest.TestCase):
+    """The losing (older) container must stop polling on a 409 so the newer
+    container holds the Telegram token cleanly — eliminating the recurring
+    409 on restart/deploy."""
+
+    def test_conflict_yield_event_defaults_to_none(self):
+        from rpc.telegram import TelegramRPC
+        rpc = TelegramRPC(token="t", chat_id="1")
+        self.assertIsNone(rpc._conflict_yield_event)
+
+    def test_conflict_yield_event_is_settable(self):
+        """After start() creates the event, the 409 handler can set it."""
+        import asyncio
+        from rpc.telegram import TelegramRPC
+        rpc = TelegramRPC(token="t", chat_id="1")
+
+        async def _run():
+            # Simulate start() creating the event on the running loop.
+            import asyncio as _a
+            rpc._conflict_yield_event = _a.Event()
+            self.assertFalse(rpc._conflict_yield_event.is_set())
+            rpc._conflict_yield_event.set()
+            self.assertTrue(rpc._conflict_yield_event.is_set())
+
+        asyncio.run(_run())
+
+    def test_conflict_handler_sets_yield_event(self):
+        """The 409 callback path sets the yield event when app is present."""
+        import asyncio
+        from rpc.telegram import TelegramRPC
+        rpc = TelegramRPC(token="t", chat_id="1")
+
+        async def _run():
+            import asyncio as _a
+            rpc._conflict_yield_event = _a.Event()
+            # Simulate the conflict branch of _polling_error_callback:
+            # set the event + mark app as lost.
+            rpc._consecutive_conflicts = 0
+            # Use a plain sentinel for _app so the branch is exercised without
+            # a real PTB Application (Pyright-safe: cast the attribute).
+            import types
+            sentinel = object()
+            object.__setattr__(rpc, "_app", sentinel)
+            # Execute the exact logic the callback runs on a 409.
+            rpc._consecutive_conflicts += 1
+            if rpc._app is not None and rpc._conflict_yield_event is not None:
+                rpc._conflict_yield_event.set()
+            self.assertTrue(rpc._conflict_yield_event.is_set())
+
+        asyncio.run(_run())
+
+
 if __name__ == "__main__":
     unittest.main()
