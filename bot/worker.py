@@ -527,12 +527,16 @@ class BotWorker:
                         # close with a fresh candle close as the new price
                         # reference.
                         self._last_entry_candle_ms[pair] = candle_ms
-                        # Also clear any resting limit mark for this pair so
-                        # the SKIP is definitive — a limit that was placed
+                        # Also clear both resting-limit marks for this pair so
+                        # the SKIP is definitive. A limit that was placed
                         # earlier on this same candle (before the price ran
                         # past the max) is no longer valid; it will auto-
-                        # cancel at its GTX expiry.
+                        # cancel at its GTX expiry. Both marks must be cleared
+                        # (not just the ms one) or the next tick's verify
+                        # block matches a dead clientOrderId and incorrectly
+                        # holds instead of re-placing.
                         self._open_signal_limit_ms.pop(pair, None)
+                        self._open_signal_limit_client_id.pop(pair, None)
                         continue
 
                     # A still-resting, unfilled signal limit on this same
@@ -546,11 +550,25 @@ class BotWorker:
                         still_resting = False
                         try:
                             open_orders = self.exchange.fetch_open_orders(pair)
-                            still_resting = any(
-                                str(o.get("clientOrderId", "")) == cid
-                                for o in open_orders
-                                if cid
-                            )
+                            if cid:
+                                still_resting = any(
+                                    str(o.get("clientOrderId", "")) == cid
+                                    for o in open_orders
+                                )
+                            else:
+                                # ms mark set but client_id missing (crash
+                                # between the two assignments, or a stale
+                                # in-memory state). We cannot confirm the
+                                # limit is on the book — assume it may be
+                                # resting to avoid double-placing, but log
+                                # so the inconsistency is visible.
+                                logger.warning(
+                                    f"ENTRY on {pair}: signal limit ms mark "
+                                    f"set for candle {candle_ms} but no "
+                                    f"client_id recorded; cannot verify — "
+                                    f"holding this tick."
+                                )
+                                still_resting = True
                         except Exception as e:
                             # Can't verify — assume still resting to avoid
                             # double-placing; the next tick re-checks.
