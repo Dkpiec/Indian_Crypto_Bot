@@ -125,6 +125,14 @@ def main() -> None:
         try:
             backoff = 5
             while not worker._stop_forever:
+                # SIGTERM/SIGINT (Coolify restart) → worker._handle_signal
+                # sets _stop_requested. Release the Telegram token BEFORE
+                # the process exits: cancel the polling loop here so the
+                # next container's getUpdates does not race a still-polling
+                # old instance (the 409 Conflict seen on every deploy).
+                if worker._stop_requested:
+                    logger.info("Stop requested — releasing Telegram token before exit")
+                    break
                 try:
                     await _run_worker_once()
                     backoff = 5  # clean stop — no restart
@@ -140,7 +148,10 @@ def main() -> None:
                     backoff = min(backoff * 2, 120)
         finally:
             if rpc_manager:
-                await rpc_manager.stop()
+                try:
+                    await asyncio.wait_for(rpc_manager.stop(), timeout=10)
+                except Exception as e:
+                    logger.warning(f"Telegram RPC stop timed out/failed: {e}")
 
     try:
         asyncio.run(run_with_telegram())

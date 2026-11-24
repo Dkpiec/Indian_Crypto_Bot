@@ -54,6 +54,11 @@ class BotWorker:
         # Supervisor restart flag: when True the main-loop supervisor stops
         # restarting the worker thread instead of backing off forever.
         self._stop_forever = False
+        # Set True by _handle_signal on SIGTERM/SIGINT. bot.main's supervisor
+        # polls this to know it must release the Telegram token (cancel the
+        # RPC) before the process exits, so the next container's start does
+        # not hit a 409 Conflict against a still-polling old instance.
+        self._stop_requested = False
         # Backoff between failed loop ticks — prevents a crash-loop when a
         # transient error (network, exchange 5xx) repeats every throttle second.
         self._error_backoff = 0
@@ -123,9 +128,16 @@ class BotWorker:
         signal.signal(signal.SIGINT, self._handle_signal)
 
     def _handle_signal(self, signum, frame):
+        # SIGTERM/SIGINT (Coolify restart, container kill, /stop). Set the
+        # shutdown flag so BOTH the worker loop AND bot.main's supervisor
+        # observe it. bot.main polls _stop_requested and, on seeing it,
+        # cancels the Telegram RPC (releasing the polling token) BEFORE the
+        # process exits — this is what prevents the next container's 409
+        # Conflict on the shared Telegram bot token.
         logger.info(f"Received signal {signum}, shutting down gracefully")
         self._running = False
         self.state = "STOPPED"
+        self._stop_requested = True
 
     def _open_position_count(self) -> int:
         """Number of currently open positions with non-zero contract size.

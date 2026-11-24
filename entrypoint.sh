@@ -113,6 +113,40 @@ HTTPServer(('0.0.0.0', 8080), H).serve_forever()
 HEALTH_PID=$!
 echo "Health check running on :8080 (PID=$HEALTH_PID)"
 
-# Start the bot
+# Start the bot.
+#
+# Do NOT `exec` the bot: run it in the foreground of THIS shell under a trap
+# so that on SIGTERM/SIGINT (Coolify restart / container stop) we:
+#   1. forward the signal to the bot process so its Python signal handler
+#      (worker._handle_signal -> _stop_requested=True) fires,
+#   2. wait up to GRACE_SECS for the bot to release the Telegram token
+#      (bot.main cancels the RPC in its finally block),
+#   3. kill the bot + health-checker if they are still alive.
+#
+# This is what stops the old container's Telegram polling loop from outliving
+# the new one and causing a 409 Conflict on the shared bot token at the next
+# deploy. `exec` (the old behaviour) replaced the shell, so a trap could not
+# survive and the bot was only killed by the container runtime's SIGKILL.
 echo "Starting bot process..."
-exec python3 -m bot.main
+python3 -m bot.main &
+BOT_PID=$!
+
+# Grace period: give the bot time to stop its Telegram polling loop before
+# we escalate to SIGKILL. 20s covers the 10s RPC-stop timeout + margin.
+GRACE_SECS="${STOP_GRACE_SECS:-20}"
+
+_forward_signal() {
+    local sig="$1"
+    echo "entrypoint: forwarding ${sig} to bot (PID ${BOT_PID}) and health-checker (PID ${HEALTH_PID})"
+    kill -"${sig}" "${BOT_PID}" 2>/dev/null
+    kill -"${sig}" "${HEALTH_PID}" 2>/dev/null
+}
+
+trap '_forward_signal TERM; for _ in $(seq 1 '"$GRACE_SECS"'); do kill -0 "${BOT_PID}" 2>/dev/null || break; sleep 1; done; kill -KILL "${BOT_PID}" 2>/dev/null; kill -KILL "${HEALTH_PID}" 2>/dev/null; echo "entrypoint: shutdown complete, exiting"; exit 143' TERM
+trap '_forward_signal INT;  for _ in $(seq 1 '"$GRACE_SECS"'); do kill -0 "${BOT_PID}" 2>/dev/null || break; sleep 1; done; kill -KILL "${BOT_PID}" 2>/dev/null; kill -KILL "${HEALTH_PID}" 2>/dev/null; echo "entrypoint: shutdown complete, exiting"; exit 130' INT
+
+# Wait for the bot to finish (clean stop via SIGTERM handler, or crash).
+wait "${BOT_PID}"
+BOT_EXIT=$?
+kill "${HEALTH_PID}" 2>/dev/null
+exit "${BOT_EXIT}"
