@@ -26,6 +26,9 @@ class TelegramRPC:
         # event loop); None until start() runs. When set, the polling loop
         # stops so the newer instance holds the token cleanly.
         self._conflict_yield_event = None
+        # Set by stop() so the conflict-watchdog's reclaim loop knows to
+        # exit and stop re-arming polling.
+        self._stop_requested = False
         # The worker thread and the Telegram event-loop thread both read
         # bot_worker and /reload_conf mutates worker.state and the strategy.
         # This lock serializes state mutation against in-flight ticks so a
@@ -123,6 +126,9 @@ class TelegramRPC:
             # race (the previous code assigned it after start_polling).
             import asyncio as _asyncio
             self._conflict_yield_event = _asyncio.Event()
+            # Reclaim guard: after we stop polling on a 409, we must NOT
+            # let a later reclaim attempt re-arm the stop path.
+            self._reclaim_started = False
 
             def _polling_error_callback(err) -> None:
                 # PTB raises telegram.error.Conflict on a 409. Detect by
@@ -159,39 +165,94 @@ class TelegramRPC:
                 self._consecutive_conflicts = 0
                 logger.error(f"Telegram polling error: {err}")
 
-            if self._app.updater is not None:
-                await self._app.updater.start_polling(
-                    drop_pending_updates=True,
+            async def _start_polling_once() -> None:
+                """Start the updater's polling loop (idempotent enough for
+                re-arming after a 409 yield)."""
+                app = self._app
+                if app is None or app.updater is None:
+                    return
+                await app.updater.start_polling(
+                    drop_pending_updates=False,  # keep the queue intact across reclaims
                     error_callback=_polling_error_callback,
                 )
 
-                async def _conflict_watchdog():
-                    """When this instance loses the token (409), stop its own
-                    polling so the newer instance can own the token. The
-                    trading loop is unaffected — only this instance's command
-                    interface is disabled."""
-                    evt = self._conflict_yield_event
-                    if evt is None:
-                        return
+            await _start_polling_once()
+
+            async def _conflict_watchdog() -> None:
+                """When this instance loses the token (409), stop its own
+                polling so the newer instance can own the token. The
+                trading loop is unaffected — only this instance's command
+                interface is disabled.
+
+                After yielding, RE-CLAIM: if the other instance was just a
+                short-lived orphan (a still-dying container from the
+                previous deploy) and the token frees up, this instance
+                restarts its polling so the bot keeps serving commands
+                instead of staying permanently dead. Back off so we don't
+                hammer getUpdates while the real winner is still up.
+                """
+                evt = self._conflict_yield_event
+                if evt is None:
+                    return
+                while True:
                     try:
                         await evt.wait()
                     except Exception:
                         return
+                    # We lost the token — stop polling so the newer instance
+                    # can own it cleanly.
                     logger.info(
                         "Conflict watchdog: this instance lost the Telegram "
                         "token; stopping its polling loop so the newer "
                         "instance holds the token."
                     )
                     try:
-                        if self._app and self._app.updater:
-                            await self._app.updater.stop()
+                        app = self._app
+                        if app and app.updater:
+                            await app.updater.stop()
                     except Exception as e:
                         logger.warning(f"conflict watchdog: updater.stop() "
                                        f"failed: {e}")
-                    # Mark the RPC as stopped so stop() is a no-op later.
-                    self._app = None
 
-                _asyncio.ensure_future(_conflict_watchdog())
+                    # Reclaim loop: try to re-acquire the token with backoff.
+                    # A 409 on the next getUpdates means someone else still
+                    # holds it — back off and retry. A clean start means we
+                    # won and resume serving commands.
+                    self._reclaim_started = True
+                    delay = 5.0
+                    while True:
+                        try:
+                            await _asyncio.sleep(delay)
+                        except _asyncio.CancelledError:
+                            raise
+                        if self._stop_requested:
+                            return
+                        try:
+                            await _start_polling_once()
+                        except Exception as e:
+                            # A 409 during (re)start means another instance
+                            # still owns the token. Keep retrying with a
+                            # longer backoff; do not crash the loop.
+                            logger.warning(
+                                "Reclaim attempt failed (likely still "
+                                f"conflicted): {e}. Retrying in {delay:.0f}s."
+                            )
+                            delay = min(delay * 2, 60.0)
+                            continue
+                        # Reclaim succeeded — we are the poller again.
+                        logger.info(
+                            "Conflict watchdog: re-acquired the Telegram "
+                            "token; polling resumed."
+                        )
+                        # Reset the event so a FUTURE 409 re-triggers the
+                        # yield path.
+                        try:
+                            evt.clear()
+                        except Exception:
+                            pass
+                        break
+
+            _asyncio.ensure_future(_conflict_watchdog())
 
             logger.info("Telegram RPC started, polling for commands")
 
@@ -202,6 +263,8 @@ class TelegramRPC:
 
     async def stop(self) -> None:
         """Stop the Telegram polling loop."""
+        # Tell the conflict-watchdog to stop reclaiming the token.
+        self._stop_requested = True
         if self._app is not None:
             try:
                 await self._app.stop()

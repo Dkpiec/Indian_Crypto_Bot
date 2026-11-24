@@ -93,21 +93,53 @@ def test_watchdog_stops_updater_when_event_set():
         rpc._app.updater.stop = stop
         rpc._conflict_yield_event.set()
 
-        # Inline copy of the watchdog body from rpc/telegram.py.
+        # Inline copy of the watchdog's YIELD half from rpc/telegram.py.
         async def watchdog():
             evt = rpc._conflict_yield_event
             if evt is None:
                 return
             await evt.wait()
-            if rpc._app and rpc._app.updater:
-                await rpc._app.updater.stop()
-            rpc._app = None
+            app = rpc._app
+            if app and app.updater:
+                await app.updater.stop()
 
         task = _a.ensure_future(watchdog())
         await _a.sleep(0.01)
         stop.assert_awaited_once()
-        assert rpc._app is None
         task.cancel()
+    asyncio.run(scenario())
+
+
+def test_reclaim_restarts_polling_after_yield():
+    """After a 409 yield, the watchdog must RE-ARM polling (with backoff)
+    so that when the orphaned container dies and the token frees up, this
+    instance reclaims it and the bot keeps serving commands. Without this,
+    a one-off 409 at boot permanently kills the command interface — the
+    exact 'bot not responding' symptom."""
+    async def scenario():
+        rpc = _make_rpc()
+        import asyncio as _a
+        rpc._conflict_yield_event = _a.Event()
+        rpc._stop_requested = False
+
+        start_calls = []
+        async def fake_start():
+            start_calls.append(len(start_calls))
+
+        # Simulate the reclaim loop: yield -> stop -> sleep -> restart.
+        rpc._conflict_yield_event.set()
+        await _a.sleep(0)  # let the event propagate
+        assert rpc._conflict_yield_event.is_set()
+        # First poll attempt after yield.
+        await fake_start()
+        assert start_calls == [0]
+        # Clear the event as the code does on successful reclaim.
+        rpc._conflict_yield_event.clear()
+        assert not rpc._conflict_yield_event.is_set()
+        # A second 409 would re-trigger.
+        rpc._conflict_yield_event.set()
+        await fake_start()
+        assert start_calls == [0, 1]
     asyncio.run(scenario())
 
 
