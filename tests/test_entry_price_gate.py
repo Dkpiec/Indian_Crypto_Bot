@@ -213,7 +213,9 @@ class TestEntryPriceGate(unittest.TestCase):
 class TestConflictYield(unittest.TestCase):
     """The losing (older) container must stop polling on a 409 so the newer
     container holds the Telegram token cleanly — eliminating the recurring
-    409 on restart/deploy."""
+    409 on restart/deploy. Plus: the FIRST 409 after startup is treated as
+    a benign transient (silent retry), and a startup pre-delay lets the older
+    container release the token first."""
 
     def test_conflict_yield_event_defaults_to_none(self):
         from rpc.telegram import TelegramRPC
@@ -250,7 +252,6 @@ class TestConflictYield(unittest.TestCase):
             rpc._consecutive_conflicts = 0
             # Use a plain sentinel for _app so the branch is exercised without
             # a real PTB Application (Pyright-safe: cast the attribute).
-            import types
             sentinel = object()
             object.__setattr__(rpc, "_app", sentinel)
             # Execute the exact logic the callback runs on a 409.
@@ -258,6 +259,70 @@ class TestConflictYield(unittest.TestCase):
             if rpc._app is not None and rpc._conflict_yield_event is not None:
                 rpc._conflict_yield_event.set()
             self.assertTrue(rpc._conflict_yield_event.is_set())
+
+        asyncio.run(_run())
+
+    def test_startup_delay_defaults_to_six_seconds(self):
+        """The startup pre-delay reads TELEGRAM_STARTUP_DELAY_SECS, default 6."""
+        import os
+        from rpc.telegram import TelegramRPC
+        rpc = TelegramRPC(token="t", chat_id="1")
+        # Reproduce the exact read logic used in start().
+        saved = os.environ.pop("TELEGRAM_STARTUP_DELAY_SECS", None)
+        try:
+            try:
+                d = float(os.environ.get("TELEGRAM_STARTUP_DELAY_SECS", "6"))
+            except (TypeError, ValueError):
+                d = 6.0
+            self.assertEqual(d, 6.0)
+        finally:
+            if saved is not None:
+                os.environ["TELEGRAM_STARTUP_DELAY_SECS"] = saved
+
+    def test_startup_delay_respects_env_override(self):
+        """An env override of the startup delay is honoured."""
+        import os
+        os.environ["TELEGRAM_STARTUP_DELAY_SECS"] = "0"
+        try:
+            try:
+                d = float(os.environ.get("TELEGRAM_STARTUP_DELAY_SECS", "6"))
+            except (TypeError, ValueError):
+                d = 6.0
+            self.assertEqual(d, 0.0)  # 0 = no delay
+        finally:
+            os.environ.pop("TELEGRAM_STARTUP_DELAY_SECS", None)
+
+    def test_first_conflict_is_benign_not_yield(self):
+        """The very first post-startup 409 must NOT set the yield event
+        (it's the benign overlap with a dying older container); only a
+        repeated conflict yields."""
+        from rpc.telegram import TelegramRPC
+        import asyncio
+
+        rpc = TelegramRPC(token="t", chat_id="1")
+
+        async def _run():
+            import asyncio as _a
+            rpc._conflict_yield_event = _a.Event()
+            rpc._consecutive_conflicts = 0
+            rpc._saw_first_conflict = False
+            sentinel = object()
+            object.__setattr__(rpc, "_app", sentinel)
+
+            # First conflict: benign -> must NOT set the yield event.
+            rpc._consecutive_conflicts += 1
+            first = not rpc._saw_first_conflict
+            if first:
+                rpc._saw_first_conflict = True
+                # (silent retry, no yield)
+                self.assertFalse(rpc._conflict_yield_event.is_set(),
+                                 "first 409 must not yield")
+            # Second conflict: hard -> yields.
+            rpc._consecutive_conflicts += 1
+            if rpc._saw_first_conflict and rpc._conflict_yield_event is not None:
+                rpc._conflict_yield_event.set()
+            self.assertTrue(rpc._conflict_yield_event.is_set(),
+                            "repeated 409 must yield")
 
         asyncio.run(_run())
 

@@ -5,6 +5,7 @@ No hardcoded placeholders — every response reflects actual account state.
 """
 
 import logging
+import os
 import threading
 from typing import Any, Optional
 
@@ -120,6 +121,11 @@ class TelegramRPC:
             # loser, it stops its own polling loop so the winner holds the
             # token cleanly.
             self._consecutive_conflicts = 0
+            # Track the first post-startup conflict so we can treat it as a
+            # benign race (the older container finishing its graceful stop)
+            # rather than a hard yield. The very first 409 after start is
+            # retried silently; only repeated conflicts disable this instance.
+            self._saw_first_conflict = False
 
             # Create the yield event BEFORE start_polling so the error
             # callback can safely set it on the very first 409 without a
@@ -129,6 +135,24 @@ class TelegramRPC:
             # Reclaim guard: after we stop polling on a 409, we must NOT
             # let a later reclaim attempt re-arm the stop path.
             self._reclaim_started = False
+
+            # Startup pre-delay: before the first live poll, wait a short,
+            # bounded window for any older container to finish its graceful
+            # Telegram shutdown (the entrypoint gives the dying bot up to
+            # ~20s to stop its RPC). This collapses the overlap window that
+            # produces the single "initial" 409 on restart, so the new
+            # instance usually wins the token on its first poll with no 409
+            # logged at all. Configurable via TELEGRAM_STARTUP_DELAY_SECS.
+            try:
+                startup_delay = float(os.environ.get(
+                    "TELEGRAM_STARTUP_DELAY_SECS", "6"))
+            except (TypeError, ValueError):
+                startup_delay = 6.0
+            if startup_delay > 0:
+                logger.info(
+                    f"Telegram RPC: waiting {startup_delay:.0f}s before "
+                    "first poll to let any older container release the token")
+                await _asyncio.sleep(startup_delay)
 
             def _polling_error_callback(err) -> None:
                 # PTB raises telegram.error.Conflict on a 409. Detect by
@@ -142,6 +166,20 @@ class TelegramRPC:
                 )
                 if is_conflict:
                     self._consecutive_conflicts += 1
+                    if not self._saw_first_conflict:
+                        # The very first 409 after startup is almost always
+                        # the benign overlap with an older container still
+                        # finishing its graceful Telegram shutdown. Treat it
+                        # as transient: log at INFO (not WARNING), let PTB's
+                        # built-in poll retry re-poll shortly, and do NOT
+                        # disable this instance. This avoids the scary
+                        # 409 log on every restart.
+                        self._saw_first_conflict = True
+                        logger.info(
+                            "Telegram: transient token conflict on first poll "
+                            "(an older instance is releasing the token); "
+                            "retrying — will keep this instance active.")
+                        return
                     logger.warning(
                         "Telegram Conflict: another bot instance holds this "
                         "token (likely an orphaned container from a previous "
