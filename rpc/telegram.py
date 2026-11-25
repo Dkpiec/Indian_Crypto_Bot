@@ -145,9 +145,9 @@ class TelegramRPC:
             # logged at all. Configurable via TELEGRAM_STARTUP_DELAY_SECS.
             try:
                 startup_delay = float(os.environ.get(
-                    "TELEGRAM_STARTUP_DELAY_SECS", "6"))
+                    "TELEGRAM_STARTUP_DELAY_SECS", "12"))
             except (TypeError, ValueError):
-                startup_delay = 6.0
+                startup_delay = 12.0
             if startup_delay > 0:
                 logger.info(
                     f"Telegram RPC: waiting {startup_delay:.0f}s before "

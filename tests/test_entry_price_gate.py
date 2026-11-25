@@ -263,7 +263,7 @@ class TestConflictYield(unittest.TestCase):
         asyncio.run(_run())
 
     def test_startup_delay_defaults_to_six_seconds(self):
-        """The startup pre-delay reads TELEGRAM_STARTUP_DELAY_SECS, default 6."""
+        """The startup pre-delay reads TELEGRAM_STARTUP_DELAY_SECS, default 12."""
         import os
         from rpc.telegram import TelegramRPC
         rpc = TelegramRPC(token="t", chat_id="1")
@@ -271,10 +271,10 @@ class TestConflictYield(unittest.TestCase):
         saved = os.environ.pop("TELEGRAM_STARTUP_DELAY_SECS", None)
         try:
             try:
-                d = float(os.environ.get("TELEGRAM_STARTUP_DELAY_SECS", "6"))
+                d = float(os.environ.get("TELEGRAM_STARTUP_DELAY_SECS", "12"))
             except (TypeError, ValueError):
-                d = 6.0
-            self.assertEqual(d, 6.0)
+                d = 12.0
+            self.assertEqual(d, 12.0)
         finally:
             if saved is not None:
                 os.environ["TELEGRAM_STARTUP_DELAY_SECS"] = saved
