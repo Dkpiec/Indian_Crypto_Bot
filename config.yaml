@@ -58,15 +58,19 @@ trading:
   leverage: 5
   use_full_balance: true
   # Entry price gate + limit-order behavior. On a closed-candle signal the live
-  # price has usually moved; instead of a blind MARKET fill we compare the
-  # live last price to the signal close:
-  #   dev <= entry_min_deviation_pct -> MARKET (already at the signal price)
-  #   min < dev <= entry_max_deviation_pct -> LIMIT at the signal price (GTX)
+  # price has usually moved; we ALWAYS place a LIMIT at the signal price (GTX).
+  # The live price deviation only determines whether we SKIP entirely:
+  #   dev <= entry_max_deviation_pct -> LIMIT at signal price (GTX)
   #   dev  > entry_max_deviation_pct -> SKIP the entry (price moved too far)
   # A resting signal limit auto-cancels after entry_limit_expires_secs.
   entry_max_deviation_pct: 1.0
-  entry_min_deviation_pct: 0.25
   entry_limit_expires_secs: 1800
+  # Exit price gate + limit-order behavior. Same logic for exits:
+  #   dev <= exit_max_deviation_pct -> LIMIT at exit signal price (GTX)
+  #   dev  > exit_max_deviation_pct -> SKIP the exit (price moved too far)
+  # A resting exit limit auto-cancels after exit_limit_expires_secs.
+  exit_max_deviation_pct: 1.0
+  exit_limit_expires_secs: 1800
 
 internals:
   process_throttle_secs: 5

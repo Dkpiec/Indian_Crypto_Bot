@@ -1,10 +1,9 @@
-"""Entry price-gate + market/limit selection tests.
+"""Entry/Exit price-gate + limit-order selection tests.
 
 Regression coverage for the "check live price before taking a signal"
-change: when the live last price has moved away from the signal close
-more than entry_max_deviation_pct the entry is SKIPPED; when it is
-close but not at the signal a LIMIT order is placed; when it is at
-the signal a MARKET order is placed.
+change: we ALWAYS place a LIMIT at the signal price (GTX) when the live
+price is within the max deviation; otherwise we SKIP. This applies to
+both entry and exit.
 """
 import os
 import sys
@@ -50,8 +49,9 @@ def _make_worker(max_open=4, free=200.0, used=0.0, leverage=5, trading=None):
             "leverage": leverage,
             "use_full_balance": True,
             "entry_max_deviation_pct": 1.0,
-            "entry_min_deviation_pct": 0.25,
             "entry_limit_expires_secs": 1800,
+            "exit_max_deviation_pct": 1.0,
+            "exit_limit_expires_secs": 1800,
             **(trading or {}),
         },
         "pairlists": [{"method": "StaticPairList", "pairs": ["TRX/USDT:USDT"]}],
@@ -74,6 +74,9 @@ def _make_worker(max_open=4, free=200.0, used=0.0, leverage=5, trading=None):
         def fetch_positions(self, *a, **k):
             return []
 
+        def fetch_open_orders(self, *a, **k):
+            return []
+
         def create_order(self, *a, **k):
             return {"id": 1}
 
@@ -86,17 +89,17 @@ def _make_worker(max_open=4, free=200.0, used=0.0, leverage=5, trading=None):
 
 
 class TestEntryPriceGate(unittest.TestCase):
-    def test_market_when_live_price_at_signal(self):
-        """dev=0% → MARKET mode, no limit order expected."""
+    def test_limit_when_live_price_at_signal(self):
+        """dev=0% → LIMIT mode at signal price (no MARKET anymore)."""
         w, ex = _make_worker()
         # Live price exactly equals the signal price.
         ex._last = 0.0224
         result = w._resolve_entry_mode("TRX/USDT:USDT", signal_price=0.0224)
-        self.assertEqual(result["mode"], "MARKET")
+        self.assertEqual(result["mode"], "LIMIT")
         self.assertAlmostEqual(result["deviation"], 0.0, places=6)
 
     def test_limit_when_live_price_within_max_deviation(self):
-        """dev=0.5% (0.25 < 0.5 <= 1.0) → LIMIT mode."""
+        """dev=0.5% (0.5 <= 1.0) → LIMIT mode."""
         w, ex = _make_worker()
         # live price 0.5% above signal
         signal_price = 0.0224
@@ -153,6 +156,9 @@ class TestEntryPriceGate(unittest.TestCase):
             def fetch_positions(self, *a, **k):
                 return []
 
+            def fetch_open_orders(self, *a, **k):
+                return []
+
             def create_order(self, *a, **k):
                 return {"id": 1}
 
@@ -162,15 +168,16 @@ class TestEntryPriceGate(unittest.TestCase):
         ex = _Ex()
         w = BotWorker(cfg, ex, _Strategy(), _Wallet(), rpc_manager=None)
         self.assertAlmostEqual(w.entry_max_deviation_pct, 1.0, places=6)
-        self.assertAlmostEqual(w.entry_min_deviation_pct, 0.25, places=6)
         self.assertEqual(w.entry_limit_expires_secs, 1800)
+        self.assertAlmostEqual(w.exit_max_deviation_pct, 1.0, places=6)
+        self.assertEqual(w.exit_limit_expires_secs, 1800)
         self.assertEqual(w._open_signal_limit_ms, {})
         self.assertEqual(w._open_signal_limit_client_id, {})
+        self.assertEqual(w._open_exit_limit_ms, {})
+        self.assertEqual(w._open_exit_limit_client_id, {})
 
     def test_skip_clears_both_limit_marks(self):
-        """Regression for the audit fix: a SKIP that clears the ms mark must
-        also clear the client_id mark, otherwise the next tick's verify
-        block matches a dead clientOrderId and incorrectly holds."""
+        """Regression: a SKIP that clears the ms mark must also clear the client_id mark."""
         w, ex = _make_worker()
         pair = "TRX/USDT:USDT"
         candle_ms = 1700000000000
@@ -182,9 +189,7 @@ class TestEntryPriceGate(unittest.TestCase):
         ex._last = 0.0224 * 1.02  # 2% above signal → SKIP
         entry = w._resolve_entry_mode(pair, 0.0224)
         self.assertEqual(entry["mode"], "SKIP")
-        # The SKIP branch in worker.py clears both marks (test the
-        # equivalent state transition here by invoking the same logic
-        # the worker would run).
+        # The SKIP branch in worker.py clears both marks.
         w._open_signal_limit_ms.pop(pair, None)
         w._open_signal_limit_client_id.pop(pair, None)
         self.assertNotIn(pair, w._open_signal_limit_ms)
@@ -208,6 +213,55 @@ class TestEntryPriceGate(unittest.TestCase):
         # after the hold, the ms mark is still set (not cleared).
         ms_was_set = w._open_signal_limit_ms.get(pair) == candle_ms
         self.assertTrue(ms_was_set, "precondition: ms mark must be set")
+
+
+class TestExitPriceGate(unittest.TestCase):
+    """Exit price-gate tests: same logic as entry but for exits."""
+
+    def test_limit_when_live_price_at_exit_signal(self):
+        """dev=0% → LIMIT mode at exit signal price."""
+        w, ex = _make_worker()
+        ex._last = 0.0224
+        result = w._resolve_exit_mode("TRX/USDT:USDT", signal_price=0.0224)
+        self.assertEqual(result["mode"], "LIMIT")
+        self.assertAlmostEqual(result["deviation"], 0.0, places=6)
+
+    def test_limit_when_live_price_within_max_deviation(self):
+        """dev=0.5% (0.5 <= 1.0) → LIMIT mode."""
+        w, ex = _make_worker()
+        signal_price = 0.0224
+        live_price = signal_price * 1.005
+        ex._last = live_price
+        result = w._resolve_exit_mode("TRX/USDT:USDT", signal_price)
+        self.assertEqual(result["mode"], "LIMIT")
+        self.assertAlmostEqual(result["deviation"], 0.5, places=2)
+
+    def test_skip_when_live_price_beyond_max_deviation(self):
+        """dev=2% (> 1.0 max) → SKIP mode."""
+        w, ex = _make_worker()
+        signal_price = 0.0224
+        live_price = signal_price * 1.02
+        ex._last = live_price
+        result = w._resolve_exit_mode("TRX/USDT:USDT", signal_price)
+        self.assertEqual(result["mode"], "SKIP")
+        self.assertAlmostEqual(result["deviation"], 2.0, places=2)
+
+    def test_fallback_to_skip_when_live_price_unavailable(self):
+        """live_price=0 / ticker failure → SKIP."""
+        w, ex = _make_worker()
+        ex._last = 0.0
+        result = w._resolve_exit_mode("TRX/USDT:USDT", signal_price=0.0224)
+        self.assertEqual(result["mode"], "SKIP")
+        self.assertAlmostEqual(result["deviation"], 0.0, places=6)
+
+    def test_fallback_to_skip_when_ticker_raises(self):
+        """ticker raises → SKIP."""
+        w, ex = _make_worker()
+        def _raise(pair):
+            raise RuntimeError("ticker rate-limited")
+        ex.fetch_ticker = _raise
+        result = w._resolve_exit_mode("TRX/USDT:USDT", signal_price=0.0224)
+        self.assertEqual(result["mode"], "SKIP")
 
 
 class TestConflictYield(unittest.TestCase):
