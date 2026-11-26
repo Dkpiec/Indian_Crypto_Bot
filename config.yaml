@@ -71,6 +71,14 @@ trading:
   # A resting exit limit auto-cancels after exit_limit_expires_secs.
   exit_max_deviation_pct: 1.0
   exit_limit_expires_secs: 1800
+  # Trailing stop-loss (STOP_LIMIT on Binance futures).
+  # Activates once price moves favorably by trail_activation_pct.
+  # Thereafter, stop price trails at trail_distance_pct below highest price.
+  # Uses STOP_LIMIT: when triggered, places a LIMIT at stop price (GTX).
+  # Only moves UP (never down). Disabled if trail_distance_pct <= 0.
+  trail_activation_pct: 1.0
+  trail_distance_pct: 1.5
+  trail_limit_expires_secs: 3600
 
 internals:
   process_throttle_secs: 5

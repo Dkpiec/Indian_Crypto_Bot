@@ -118,6 +118,21 @@ class BotWorker:
         self.exit_limit_expires_secs = int(
             trading_conf.get("exit_limit_expires_secs", 1800)
         )
+        # Trailing stop-loss knobs. Uses STOP_LIMIT on Binance futures:
+        # - trail_activation_pct: price must move favorably by this % before
+        #   the trailing stop activates
+        # - trail_distance_pct: once active, stop trails at this % below the
+        #   highest price (for longs). 0 or negative = disabled.
+        # - trail_limit_expires_secs: TTL for the STOP_LIMIT order (GTX).
+        self.trail_activation_pct = float(
+            trading_conf.get("trail_activation_pct", 1.0)
+        )
+        self.trail_distance_pct = float(
+            trading_conf.get("trail_distance_pct", 1.5)
+        )
+        self.trail_limit_expires_secs = int(
+            trading_conf.get("trail_limit_expires_secs", 3600)
+        )
         # Track signal limit orders so we can stop re-firing a still-resting
         # (unfilled) limit on the same candle — dedupe on the candle it was
         # placed for.
@@ -129,6 +144,13 @@ class BotWorker:
         # Track resting exit limits for the same dedupe/verify logic.
         self._open_exit_limit_ms: dict[str, int] = {}
         self._open_exit_limit_client_id: dict[str, str] = {}
+        # Trailing stop state per pair:
+        #   entry_price: price at which position was opened
+        #   highest_price: highest price since entry (for trailing)
+        #   stop_order_id: exchange order ID of the STOP_LIMIT order
+        #   stop_client_id: client order ID of the STOP_LIMIT order
+        #   active: whether trailing stop has been activated
+        self._trail_state: dict[str, dict] = {}
 
         # Signal handlers for graceful shutdown
         signal.signal(signal.SIGTERM, self._handle_signal)
@@ -262,6 +284,149 @@ class BotWorker:
             "deviation": deviation,
             "mode": mode,
         }
+
+    # ------------------------------------------------------------------
+    # Trailing Stop-Loss (STOP_LIMIT on Binance futures)
+    # ------------------------------------------------------------------
+    def _init_trailing_stop(self, pair: str, entry_price: float) -> None:
+        """Initialize trailing stop state for a newly opened position."""
+        if self.trail_distance_pct <= 0:
+            return
+        self._trail_state[pair] = {
+            "entry_price": entry_price,
+            "highest_price": entry_price,
+            "stop_order_id": None,
+            "stop_client_id": None,
+            "active": False,
+        }
+        logger.info(
+            f"Trailing stop initialized for {pair} @ entry={entry_price:.6f}, "
+            f"activation={self.trail_activation_pct}%, distance={self.trail_distance_pct}%"
+        )
+
+    def _update_trailing_stop(self, pair: str, current_price: float) -> None:
+        """Update trailing stop for an open position.
+
+        Logic:
+        - If not active: check if price has moved up by trail_activation_pct
+          from entry; if so, activate and place initial STOP_LIMIT.
+        - If active: check if price has made a new high; if so, calculate new
+          stop price (highest * (1 - trail_distance_pct/100)) and update the
+          STOP_LIMIT order if the new stop is higher than the old one.
+        - Only moves UP (never down) — true trailing.
+        """
+        if self.trail_distance_pct <= 0:
+            return
+
+        state = self._trail_state.get(pair)
+        if not state:
+            return
+
+        # Update highest price
+        if current_price > state["highest_price"]:
+            state["highest_price"] = current_price
+
+        # Check activation
+        if not state["active"]:
+            entry_price = state["entry_price"]
+            gain_pct = ((current_price - entry_price) / entry_price) * 100.0
+            if gain_pct >= self.trail_activation_pct:
+                # Activate: place initial STOP_LIMIT
+                self._place_trailing_stop_order(pair, state)
+                state["active"] = True
+            return
+
+        # Already active: calculate desired stop price
+        desired_stop = state["highest_price"] * (1.0 - self.trail_distance_pct / 100.0)
+
+        # Only move stop UP (never down)
+        current_stop = state.get("stop_price", 0.0)
+        if desired_stop <= current_stop:
+            return
+
+        # Update the STOP_LIMIT order
+        self._place_trailing_stop_order(pair, state, desired_stop)
+
+    def _place_trailing_stop_order(
+        self, pair: str, state: dict, stop_price: float | None = None
+    ) -> None:
+        """Place or update a STOP_LIMIT order for trailing stop.
+
+        On Binance futures:
+        - STOP_LIMIT: when stopPrice is hit, places a LIMIT at price (GTX).
+        - We use reduce_only=True to close the position.
+        - The 'price' field is the limit price; 'stopPrice' is the trigger.
+        """
+        if stop_price is None:
+            stop_price = state["highest_price"] * (1.0 - self.trail_distance_pct / 100.0)
+
+        # Limit price slightly below stop for better fill probability
+        # (Binance requires limit price < stopPrice for sell STOP_LIMIT)
+        limit_price = stop_price * 0.999
+
+        # Get position size
+        try:
+            positions = self.exchange.fetch_positions(pair)
+            pos_qty = 0.0
+            for p in positions:
+                amt = float(p.get("positionAmt", 0))
+                if amt > 0:
+                    pos_qty += amt
+            if pos_qty <= 0:
+                return
+        except Exception as e:
+            logger.warning(f"Could not fetch position for trailing stop {pair}: {e}")
+            return
+
+        # Cancel existing stop order if any
+        if state.get("stop_order_id"):
+            try:
+                self.exchange.cancel_order(state["stop_order_id"], pair)
+            except Exception:
+                pass  # Order may have already filled/cancelled
+
+        # Place new STOP_LIMIT
+        try:
+            client_order_id = _client_order_id("ts", pair)
+            order = self.exchange.create_order(
+                symbol=pair,
+                order_type="STOP_LIMIT",
+                side="SELL",
+                amount=pos_qty,
+                price=limit_price,
+                stop_price=stop_price,
+                time_in_force="GTX",
+                reduce_only=True,
+                client_order_id=client_order_id,
+            )
+            state["stop_order_id"] = order.get("id")
+            state["stop_client_id"] = client_order_id
+            state["stop_price"] = stop_price
+            logger.info(
+                f"Trailing STOP_LIMIT placed for {pair}: "
+                f"stop={stop_price:.6f}, limit={limit_price:.6f}, qty={pos_qty:.4f}, "
+                f"GTX ttl={self.trail_limit_expires_secs}s"
+            )
+            if self.rpc_manager:
+                self.rpc_manager.send_message(
+                    f"📉 *Trailing SL Activated* `{pair}`\n"
+                    f"Stop: `{stop_price:.6f}`\n"
+                    f"Limit: `{limit_price:.6f}`\n"
+                    f"Qty: `{pos_qty:.4f}`\n"
+                    f"High: `{state['highest_price']:.6f}`"
+                )
+        except Exception as e:
+            logger.error(f"Failed to place trailing STOP_LIMIT for {pair}: {e}")
+
+    def _clear_trailing_stop(self, pair: str) -> None:
+        """Clear trailing stop state for a closed position."""
+        state = self._trail_state.pop(pair, None)
+        if state and state.get("stop_order_id"):
+            try:
+                self.exchange.cancel_order(state["stop_order_id"], pair)
+                logger.info(f"Cancelled trailing stop for {pair}")
+            except Exception:
+                pass
 
     def start(self) -> None:
         """Start the trading loop."""
@@ -872,6 +1037,35 @@ class BotWorker:
 
             except Exception as e:
                 logger.error(f"Error processing {pair}: {e}", exc_info=True)
+
+            # --- Trailing stop update for open positions ---
+            try:
+                positions = self.exchange.fetch_positions(pair)
+                pos_qty = 0.0
+                for p in positions:
+                    amt = float(p.get("positionAmt", 0))
+                    if amt > 0:
+                        pos_qty += amt
+                if pos_qty > 0:
+                    # Position is open: initialize or update trailing stop
+                    if pair not in self._trail_state:
+                        # New position detected (limit fill or manual entry)
+                        # Use current live price as entry reference
+                        ticker = self.exchange.fetch_ticker(pair)
+                        entry_ref = float(ticker.get("last", 0.0))
+                        if entry_ref > 0:
+                            self._init_trailing_stop(pair, entry_ref)
+                    # Update trailing stop with current price
+                    ticker = self.exchange.fetch_ticker(pair)
+                    current_price = float(ticker.get("last", 0.0))
+                    if current_price > 0:
+                        self._update_trailing_stop(pair, current_price)
+                else:
+                    # No position: clear any trailing stop state
+                    if pair in self._trail_state:
+                        self._clear_trailing_stop(pair)
+            except Exception as e:
+                logger.debug(f"Trailing stop update skipped for {pair}: {e}")
 
         # Update wallet balances
         self.wallets.update()
